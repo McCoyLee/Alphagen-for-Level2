@@ -108,6 +108,8 @@ def run_single_experiment(
     test_end: str = "2022-12-31",
     max_backtrack_days: int = 100,
     max_future_days: int = 30,
+    cache_dir: Optional[str] = "./out/l2_cache",
+    max_workers: int = 4,
 ):
     reseed_everything(seed)
 
@@ -151,6 +153,8 @@ def run_single_experiment(
             features=features,
             device=device,
             data_root=data_root,
+            cache_dir=cache_dir,
+            max_workers=max_workers,
         )
 
     segments = [
@@ -232,6 +236,8 @@ def main(
     test_end: str = "2022-12-31",
     max_backtrack_days: int = 100,
     max_future_days: int = 30,
+    cache_dir: Optional[str] = "./out/l2_cache",
+    max_workers: int = 4,
 ):
     """
     Train alpha factors using Level 2 local HDF5 data.
@@ -242,14 +248,8 @@ def main(
     :param data_root: Root path to Level 2 HDF5 data
     :param use_level2_features: Use extended Level 2 features (20) vs basic OHLCV (6)
     :param steps: Total RL iteration steps (None = auto based on pool_capacity)
-    :param train_start: Training period start date
-    :param train_end: Training period end date
-    :param valid_start: Validation period start date
-    :param valid_end: Validation period end date
-    :param test_start: Test period start date
-    :param test_end: Test period end date
-    :param max_backtrack_days: Historical lookback days for rolling operators
-    :param max_future_days: Forward days for target calculation
+    :param cache_dir: Directory for caching aggregated data (None to disable)
+    :param max_workers: Number of threads for parallel HDF5 IO
     """
     if isinstance(random_seeds, int):
         random_seeds = (random_seeds,)
@@ -273,6 +273,8 @@ def main(
             test_end=test_end,
             max_backtrack_days=max_backtrack_days,
             max_future_days=max_future_days,
+            cache_dir=cache_dir,
+            max_workers=max_workers,
         )
 
 

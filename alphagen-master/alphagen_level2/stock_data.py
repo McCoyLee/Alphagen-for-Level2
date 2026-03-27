@@ -5,25 +5,35 @@ Reads Level 2 HDF5 data (tick/order/transaction), aggregates intraday data
 into daily features, and presents the same tensor interface that the expression
 system expects: data shape (time_steps, n_features, n_stocks).
 
-Design choices:
-  - Daily aggregation at load time: Level 2 data is aggregated into per-day
-    feature vectors once during __init__. This avoids repeated IO during
-    expression evaluation and keeps the expression system unchanged.
-  - Extended feature set: Beyond OHLCV, we add Level 2 features like
-    bid-ask spread, order imbalance, volume-weighted metrics, etc.
-  - Memory layout: features are contiguous along dim=1 for cache-friendly
-    access during per-feature expression evaluation.
+Actual data fields:
+  tick:  Price, Volume, Turnover, AccVolume, AccTurnover, MatchItem, BSFlag,
+         BidAvgPrice, AskAvgPrice, BidPrice10(N,10), BidVolume10(N,10),
+         AskPrice10(N,10), AskVolume10(N,10), TotalBidVolume, TotalAskVolume,
+         Open, High, Low, PreClose, Time
+  order: BizIndex, OrderOriNo, OrderNumber, FunctionCode(B/S),
+         OrderKind(0/1/A/D/U/S), Price, Volume, Time
+  transaction: BidOrder, AskOrder, BSFlag, Channel, FunctionCode(0/1),
+               BizIndex, Index, OrderKind, Price, Volume, Time
+
+Performance:
+  - Daily aggregation at load time (one-shot, then pure tensor ops)
+  - Optional pickle cache to skip re-aggregation on subsequent loads
+  - Parallel date loading via ThreadPoolExecutor
+  - Vectorized numpy aggregation (no Python loops over ticks)
 """
 
 import os
+import pickle
+import hashlib
 from typing import List, Optional, Tuple, Union
 from enum import IntEnum
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
 import torch
 
-from alphagen_level2.hdf5_reader import Level2HDF5Reader
+from alphagen_level2.hdf5_reader import Level2HDF5Reader, match_char
 
 
 class Level2FeatureType(IntEnum):
@@ -31,7 +41,7 @@ class Level2FeatureType(IntEnum):
     Extended feature types including Level 2 order book features.
     The first 6 (OPEN..VWAP) match the original FeatureType for compatibility.
     """
-    # === Original daily features (compatible with FeatureType) ===
+    # === Original daily features (indices 0-5 match FeatureType) ===
     OPEN = 0
     CLOSE = 1
     HIGH = 2
@@ -40,260 +50,294 @@ class Level2FeatureType(IntEnum):
     VWAP = 5
 
     # === Level 2 tick-derived features ===
-    BID_ASK_SPREAD = 6       # Average daily bid-ask spread (ask1 - bid1)
-    BID_ASK_SPREAD_PCT = 7   # Spread as percentage of mid price
-    MID_PRICE = 8            # Average mid price = (bid1 + ask1) / 2
-    WEIGHTED_BID = 9         # Volume-weighted average bid price (top 5 levels)
-    WEIGHTED_ASK = 10        # Volume-weighted average ask price (top 5 levels)
-    ORDER_IMBALANCE = 11     # (bid_vol - ask_vol) / (bid_vol + ask_vol) at top level
-    DEPTH_IMBALANCE = 12     # Order book depth imbalance across 5 levels
+    BID_ASK_SPREAD = 6       # Daily mean spread: ask1 - bid1
+    BID_ASK_SPREAD_PCT = 7   # Spread / mid_price percentage
+    MID_PRICE = 8            # Daily mean (bid1 + ask1) / 2
+    WEIGHTED_BID = 9         # Volume-weighted average bid across 10 levels
+    WEIGHTED_ASK = 10        # Volume-weighted average ask across 10 levels
+    ORDER_IMBALANCE = 11     # (TotalBidVolume - TotalAskVolume) / total, daily mean
+    DEPTH_IMBALANCE = 12     # 10-level bid/ask volume imbalance
 
     # === Transaction-derived features ===
-    TXN_VOLUME = 13          # Total transaction volume
-    TXN_VWAP = 14            # Transaction VWAP
-    BUY_RATIO = 15           # Buy-initiated volume / total volume
-    LARGE_ORDER_RATIO = 16   # Large order volume ratio (top 10% by size)
-    TXN_COUNT = 17           # Number of transactions
+    TXN_VOLUME = 13          # Total actual trade volume (excl. cancels)
+    TXN_VWAP = 14            # Transaction VWAP (actual trades only)
+    BUY_RATIO = 15           # Active buy volume / total (from BSFlag)
+    LARGE_ORDER_RATIO = 16   # Top 10% volume / total volume
+    TXN_COUNT = 17           # Number of actual trades
 
     # === Order-derived features ===
-    ORDER_CANCEL_RATIO = 18  # Cancel order ratio (if available)
-    NET_ORDER_FLOW = 19      # Net order flow = buy_orders - sell_orders
+    ORDER_CANCEL_RATIO = 18  # OrderKind=='D' count / total orders
+    NET_ORDER_FLOW = 19      # (buy_vol - sell_vol) / total, from FunctionCode B/S
 
 
-# Mapping from original FeatureType values to Level2FeatureType
-_COMPAT_FEATURE_MAP = {
-    0: Level2FeatureType.OPEN,
-    1: Level2FeatureType.CLOSE,
-    2: Level2FeatureType.HIGH,
-    3: Level2FeatureType.LOW,
-    4: Level2FeatureType.VOLUME,
-    5: Level2FeatureType.VWAP,
-}
+# ---------------------------------------------------------------------------
+# Aggregation functions (fully vectorized numpy, no per-tick Python loops)
+# ---------------------------------------------------------------------------
 
-
-def _aggregate_tick_daily(tick_data: dict) -> dict:
+def _aggregate_tick_daily(td: dict) -> dict:
     """
-    Aggregate intraday tick data into daily OHLCV + Level 2 features.
+    Aggregate tick snapshot data → daily features.
 
-    Args:
-        tick_data: dict with keys like 'Price', 'Volume', 'BidPrice1', 'AskPrice1', etc.
-
-    Returns:
-        dict of daily aggregated feature values (scalars).
+    Uses pre-computed Open/High/Low from tick snapshots and AccVolume/AccTurnover
+    for accurate daily volume/VWAP. Handles 2D bid/ask arrays (N×10 levels).
     """
-    result = {}
-    price = tick_data.get('Price', np.array([]))
-    volume = tick_data.get('Volume', np.array([]))
-
-    if len(price) == 0:
-        return result
-
+    r = {}
+    price = td.get('Price')
+    if price is None or len(price) == 0:
+        return r
     price = price.astype(np.float64)
-    # Filter out zero/negative prices
     valid = price > 0
     if not valid.any():
-        return result
-    price_valid = price[valid]
+        return r
 
-    result['OPEN'] = float(price_valid[0])
-    result['CLOSE'] = float(price_valid[-1])
-    result['HIGH'] = float(price_valid.max())
-    result['LOW'] = float(price_valid.min())
+    # --- OHLCV from tick snapshot fields (no recomputation needed) ---
+    open_arr = td.get('Open')
+    high_arr = td.get('High')
+    low_arr = td.get('Low')
 
-    if len(volume) > 0:
-        volume = volume.astype(np.float64)
-        vol_valid = volume[valid] if len(volume) == len(price) else volume
-        result['VOLUME'] = float(vol_valid.sum())
-        # VWAP
-        if vol_valid.sum() > 0:
-            pv = price_valid[:len(vol_valid)] * vol_valid[:len(price_valid)]
-            result['VWAP'] = float(pv.sum() / vol_valid.sum())
+    if open_arr is not None and len(open_arr) > 0:
+        ov = open_arr.astype(np.float64)
+        r['OPEN'] = float(ov[ov > 0][0]) if (ov > 0).any() else float(price[valid][0])
+    else:
+        r['OPEN'] = float(price[valid][0])
+
+    r['CLOSE'] = float(price[valid][-1])
+
+    if high_arr is not None and len(high_arr) > 0:
+        hv = high_arr.astype(np.float64)
+        # High is running max, last snapshot is daily high
+        r['HIGH'] = float(hv[-1]) if hv[-1] > 0 else float(price[valid].max())
+    else:
+        r['HIGH'] = float(price[valid].max())
+
+    if low_arr is not None and len(low_arr) > 0:
+        lv = low_arr.astype(np.float64)
+        vl = lv[lv > 0]
+        r['LOW'] = float(vl[-1]) if len(vl) > 0 else float(price[valid].min())
+    else:
+        r['LOW'] = float(price[valid].min())
+
+    # Volume / VWAP from cumulative fields
+    acc_vol = td.get('AccVolume')
+    acc_turn = td.get('AccTurnover')
+    if acc_vol is not None and len(acc_vol) > 0 and float(acc_vol[-1]) > 0:
+        daily_vol = float(acc_vol[-1])
+        r['VOLUME'] = daily_vol
+        if acc_turn is not None and len(acc_turn) > 0:
+            r['VWAP'] = float(acc_turn[-1]) / daily_vol
         else:
-            result['VWAP'] = float(price_valid.mean())
+            r['VWAP'] = float(price[valid].mean())
     else:
-        result['VOLUME'] = 0.0
-        result['VWAP'] = float(price_valid.mean())
-
-    # Bid-ask features
-    bid1 = tick_data.get('BidPrice1', np.array([]))
-    ask1 = tick_data.get('AskPrice1', np.array([]))
-    if len(bid1) > 0 and len(ask1) > 0:
-        bid1 = bid1.astype(np.float64)
-        ask1 = ask1.astype(np.float64)
-        valid_ba = (bid1 > 0) & (ask1 > 0)
-        if valid_ba.any():
-            b = bid1[valid_ba]
-            a = ask1[valid_ba]
-            spread = a - b
-            mid = (a + b) / 2.0
-            result['BID_ASK_SPREAD'] = float(spread.mean())
-            result['BID_ASK_SPREAD_PCT'] = float((spread / mid).mean())
-            result['MID_PRICE'] = float(mid.mean())
+        vol = td.get('Volume')
+        if vol is not None and len(vol) > 0:
+            r['VOLUME'] = float(vol.astype(np.float64).sum())
         else:
-            result['BID_ASK_SPREAD'] = 0.0
-            result['BID_ASK_SPREAD_PCT'] = 0.0
-            result['MID_PRICE'] = float(price_valid.mean())
-    else:
-        result['BID_ASK_SPREAD'] = 0.0
-        result['BID_ASK_SPREAD_PCT'] = 0.0
-        result['MID_PRICE'] = float(price_valid.mean())
+            r['VOLUME'] = 0.0
+        r['VWAP'] = float(price[valid].mean())
 
-    # Weighted bid/ask across 5 levels
-    for side, prefix in [('WEIGHTED_BID', 'Bid'), ('WEIGHTED_ASK', 'Ask')]:
-        prices_levels = []
-        volumes_levels = []
-        for i in range(1, 6):
-            p = tick_data.get(f'{prefix}Price{i}', np.array([]))
-            v = tick_data.get(f'{prefix}Volume{i}', np.array([]))
-            if len(p) > 0 and len(v) > 0:
-                prices_levels.append(p.astype(np.float64))
-                volumes_levels.append(v.astype(np.float64))
-        if prices_levels:
-            all_p = np.stack(prices_levels, axis=1)  # (ticks, levels)
-            all_v = np.stack(volumes_levels, axis=1)
-            # Per-tick weighted price, then average across ticks
-            total_v = all_v.sum(axis=1)
-            safe_total = np.where(total_v > 0, total_v, 1.0)
-            weighted = (all_p * all_v).sum(axis=1) / safe_total
-            result[side] = float(weighted.mean())
+    # --- Bid-ask features from 2D arrays (N×10 levels) ---
+    bp10 = td.get('BidPrice10')   # shape (N, 10)
+    ap10 = td.get('AskPrice10')
+    bv10 = td.get('BidVolume10')
+    av10 = td.get('AskVolume10')
+
+    has_book = (bp10 is not None and ap10 is not None
+                and len(bp10) > 0 and bp10.ndim == 2)
+
+    if has_book:
+        bp = bp10.astype(np.float64)
+        ap = ap10.astype(np.float64)
+        bid1 = bp[:, 0]
+        ask1 = ap[:, 0]
+
+        # Filter valid snapshots (both bid1 and ask1 positive)
+        vba = (bid1 > 0) & (ask1 > 0)
+        if vba.any():
+            b1 = bid1[vba]
+            a1 = ask1[vba]
+            spread = a1 - b1
+            mid = (a1 + b1) * 0.5
+            r['BID_ASK_SPREAD'] = float(spread.mean())
+            r['BID_ASK_SPREAD_PCT'] = float((spread / mid).mean())
+            r['MID_PRICE'] = float(mid.mean())
         else:
-            result[side] = 0.0
+            r['BID_ASK_SPREAD'] = 0.0
+            r['BID_ASK_SPREAD_PCT'] = 0.0
+            r['MID_PRICE'] = float(price[valid].mean())
 
-    # Order imbalance at top level
-    bid_vol1 = tick_data.get('BidVolume1', np.array([]))
-    ask_vol1 = tick_data.get('AskVolume1', np.array([]))
-    if len(bid_vol1) > 0 and len(ask_vol1) > 0:
-        bv = bid_vol1.astype(np.float64)
-        av = ask_vol1.astype(np.float64)
-        total = bv + av
-        safe_total = np.where(total > 0, total, 1.0)
-        imb = (bv - av) / safe_total
-        result['ORDER_IMBALANCE'] = float(imb.mean())
+        # Weighted bid/ask across all 10 levels (vectorized, no loop)
+        if bv10 is not None and av10 is not None and len(bv10) > 0:
+            bv = bv10.astype(np.float64)  # (N, 10)
+            av = av10.astype(np.float64)
+
+            # Weighted bid price per snapshot, then daily mean
+            tbv = bv.sum(axis=1)            # (N,)
+            safe_tbv = np.where(tbv > 0, tbv, 1.0)
+            w_bid = (bp * bv).sum(axis=1) / safe_tbv
+            r['WEIGHTED_BID'] = float(w_bid[tbv > 0].mean()) if (tbv > 0).any() else 0.0
+
+            tav = av.sum(axis=1)
+            safe_tav = np.where(tav > 0, tav, 1.0)
+            w_ask = (ap * av).sum(axis=1) / safe_tav
+            r['WEIGHTED_ASK'] = float(w_ask[tav > 0].mean()) if (tav > 0).any() else 0.0
+
+            # Depth imbalance: per-snapshot across 10 levels
+            total_bid = bv.sum(axis=1)
+            total_ask = av.sum(axis=1)
+            denom = total_bid + total_ask
+            safe_d = np.where(denom > 0, denom, 1.0)
+            depth_imb = (total_bid - total_ask) / safe_d
+            r['DEPTH_IMBALANCE'] = float(depth_imb[denom > 0].mean()) if (denom > 0).any() else 0.0
+        else:
+            r['WEIGHTED_BID'] = 0.0
+            r['WEIGHTED_ASK'] = 0.0
+            r['DEPTH_IMBALANCE'] = 0.0
     else:
-        result['ORDER_IMBALANCE'] = 0.0
+        r['BID_ASK_SPREAD'] = 0.0
+        r['BID_ASK_SPREAD_PCT'] = 0.0
+        r['MID_PRICE'] = float(price[valid].mean())
+        r['WEIGHTED_BID'] = 0.0
+        r['WEIGHTED_ASK'] = 0.0
+        r['DEPTH_IMBALANCE'] = 0.0
 
-    # Depth imbalance across 5 levels
-    total_bid_vol = 0.0
-    total_ask_vol = 0.0
-    for i in range(1, 6):
-        bv = tick_data.get(f'BidVolume{i}', np.array([]))
-        av = tick_data.get(f'AskVolume{i}', np.array([]))
-        if len(bv) > 0:
-            total_bid_vol += float(bv.astype(np.float64).sum())
-        if len(av) > 0:
-            total_ask_vol += float(av.astype(np.float64).sum())
-    denom = total_bid_vol + total_ask_vol
-    if denom > 0:
-        result['DEPTH_IMBALANCE'] = (total_bid_vol - total_ask_vol) / denom
+    # Order imbalance: use TotalBidVolume / TotalAskVolume (all outstanding)
+    tbv_arr = td.get('TotalBidVolume')
+    tav_arr = td.get('TotalAskVolume')
+    if tbv_arr is not None and tav_arr is not None and len(tbv_arr) > 0:
+        tb = tbv_arr.astype(np.float64)
+        ta = tav_arr.astype(np.float64)
+        denom = tb + ta
+        safe_d = np.where(denom > 0, denom, 1.0)
+        oi = (tb - ta) / safe_d
+        r['ORDER_IMBALANCE'] = float(oi[denom > 0].mean()) if (denom > 0).any() else 0.0
     else:
-        result['DEPTH_IMBALANCE'] = 0.0
+        r['ORDER_IMBALANCE'] = 0.0
 
-    return result
+    return r
 
 
-def _aggregate_transaction_daily(txn_data: dict) -> dict:
-    """Aggregate intraday transaction data into daily features."""
-    result = {}
-    price = txn_data.get('Price', np.array([]))
-    volume = txn_data.get('Volume', np.array([]))
+def _aggregate_transaction_daily(td: dict) -> dict:
+    """
+    Aggregate transaction data → daily features.
 
-    if len(price) == 0:
-        result['TXN_VOLUME'] = 0.0
-        result['TXN_VWAP'] = 0.0
-        result['BUY_RATIO'] = 0.5
-        result['LARGE_ORDER_RATIO'] = 0.0
-        result['TXN_COUNT'] = 0.0
-        return result
+    Uses FunctionCode to filter actual trades (0) vs cancels (1).
+    Uses BSFlag (B/S) for precise active buy/sell classification.
+    """
+    r = {}
+    price = td.get('Price')
+    volume = td.get('Volume')
+
+    if price is None or len(price) == 0:
+        return {'TXN_VOLUME': 0.0, 'TXN_VWAP': 0.0, 'BUY_RATIO': 0.5,
+                'LARGE_ORDER_RATIO': 0.0, 'TXN_COUNT': 0.0}
 
     price = price.astype(np.float64)
-    volume = volume.astype(np.float64) if len(volume) > 0 else np.ones_like(price)
+    volume = volume.astype(np.float64) if volume is not None and len(volume) > 0 else np.ones_like(price)
 
-    result['TXN_COUNT'] = float(len(price))
-    result['TXN_VOLUME'] = float(volume.sum())
+    # Filter to actual trades (FunctionCode == 0), exclude cancels
+    func_code = td.get('FunctionCode')
+    if func_code is not None and len(func_code) > 0:
+        trade_mask = match_char(func_code, '0')
+        # Also handle integer 0
+        if not trade_mask.any():
+            if func_code.dtype.kind in ('i', 'u', 'f'):
+                trade_mask = func_code == 0
+        if trade_mask.any():
+            price = price[trade_mask]
+            volume = volume[trade_mask]
+            bs_flag = td.get('BSFlag')
+            if bs_flag is not None and len(bs_flag) > 0:
+                bs_flag = bs_flag[trade_mask]
+                td = {**td, 'BSFlag': bs_flag}  # update for buy_ratio below
 
-    if volume.sum() > 0:
-        result['TXN_VWAP'] = float((price * volume).sum() / volume.sum())
+    valid = price > 0
+    price = price[valid]
+    volume = volume[valid]
+
+    r['TXN_COUNT'] = float(len(price))
+    r['TXN_VOLUME'] = float(volume.sum())
+    r['TXN_VWAP'] = float((price * volume).sum() / volume.sum()) if volume.sum() > 0 else 0.0
+
+    # Buy ratio: from BSFlag (B=active buy, S=active sell)
+    bs_flag = td.get('BSFlag')
+    if bs_flag is not None and len(bs_flag) > 0:
+        bs = bs_flag[valid] if len(bs_flag) == len(valid) else bs_flag
+        if len(bs) == len(volume):
+            buy_mask = match_char(bs, 'B')
+            buy_vol = volume[buy_mask].sum()
+            total_vol = volume.sum()
+            r['BUY_RATIO'] = float(buy_vol / total_vol) if total_vol > 0 else 0.5
+        else:
+            r['BUY_RATIO'] = 0.5
     else:
-        result['TXN_VWAP'] = float(price.mean())
-
-    # Buy ratio: estimate from price movement (tick rule)
-    # If transaction price > previous price -> buy-initiated
-    if len(price) > 1:
-        price_diff = np.diff(price)
-        buy_mask = np.concatenate([[False], price_diff > 0])
-        sell_mask = np.concatenate([[False], price_diff < 0])
-        buy_vol = volume[buy_mask].sum()
-        sell_vol = volume[sell_mask].sum()
-        total = buy_vol + sell_vol
-        result['BUY_RATIO'] = float(buy_vol / total) if total > 0 else 0.5
-    else:
-        result['BUY_RATIO'] = 0.5
+        # Fallback: tick rule (less accurate)
+        if len(price) > 1:
+            pdiff = np.diff(price)
+            buy_m = np.concatenate([[False], pdiff > 0])
+            bvol = volume[buy_m].sum()
+            svol = volume[np.concatenate([[False], pdiff < 0])].sum()
+            t = bvol + svol
+            r['BUY_RATIO'] = float(bvol / t) if t > 0 else 0.5
+        else:
+            r['BUY_RATIO'] = 0.5
 
     # Large order ratio: top 10% by volume
     if len(volume) > 0 and volume.sum() > 0:
         threshold = np.percentile(volume, 90)
-        large_vol = volume[volume >= threshold].sum()
-        result['LARGE_ORDER_RATIO'] = float(large_vol / volume.sum())
+        r['LARGE_ORDER_RATIO'] = float(volume[volume >= threshold].sum() / volume.sum())
     else:
-        result['LARGE_ORDER_RATIO'] = 0.0
+        r['LARGE_ORDER_RATIO'] = 0.0
 
-    return result
+    return r
 
 
-def _aggregate_order_daily(order_data: dict) -> dict:
-    """Aggregate intraday order data into daily features."""
-    result = {}
-    price = order_data.get('Price', np.array([]))
-    volume = order_data.get('Volume', np.array([]))
+def _aggregate_order_daily(od: dict) -> dict:
+    """
+    Aggregate order data → daily features.
 
-    result['ORDER_CANCEL_RATIO'] = 0.0  # Requires OrderType field
-    result['NET_ORDER_FLOW'] = 0.0
+    OrderKind == 'D' → cancel orders.
+    FunctionCode == 'B'/'S' → buy/sell direction.
+    """
+    r = {'ORDER_CANCEL_RATIO': 0.0, 'NET_ORDER_FLOW': 0.0}
+    volume = od.get('Volume')
+    if volume is None or len(volume) == 0:
+        return r
+    volume = volume.astype(np.float64)
 
-    if len(price) == 0:
-        return result
+    # Cancel ratio: OrderKind == 'D'
+    order_kind = od.get('OrderKind')
+    if order_kind is not None and len(order_kind) > 0:
+        cancel_mask = match_char(order_kind, 'D')
+        total = len(order_kind)
+        r['ORDER_CANCEL_RATIO'] = float(cancel_mask.sum() / total) if total > 0 else 0.0
 
-    # If we have direction/type info, we can compute cancel ratio and net flow
-    # For now, use a simple heuristic based on available data
-    order_type = order_data.get('OrderType', np.array([]))
-    direction = order_data.get('Direction', np.array([]))
+    # Net order flow: FunctionCode B(buy) vs S(sell)
+    func_code = od.get('FunctionCode')
+    if func_code is not None and len(func_code) > 0 and len(volume) == len(func_code):
+        buy_mask = match_char(func_code, 'B')
+        sell_mask = match_char(func_code, 'S')
+        buy_vol = volume[buy_mask].sum()
+        sell_vol = volume[sell_mask].sum()
+        total_vol = buy_vol + sell_vol
+        r['NET_ORDER_FLOW'] = float((buy_vol - sell_vol) / total_vol) if total_vol > 0 else 0.0
 
-    if len(order_type) > 0:
-        # Common encoding: 0=limit, 1=market, 2=cancel
-        cancel_mask = (order_type == 2) | (order_type == ord('D'))
-        total = len(order_type)
-        result['ORDER_CANCEL_RATIO'] = float(cancel_mask.sum() / total) if total > 0 else 0.0
+    return r
 
-    if len(direction) > 0 and len(volume) > 0:
-        volume = volume.astype(np.float64)
-        direction = direction.astype(np.float64)
-        # Common encoding: 1=buy, -1=sell, or 1=buy, 2=sell
-        if direction.max() <= 1:
-            # -1/1 encoding
-            net = (volume * direction).sum()
-        else:
-            # 1/2 encoding: 1=buy, 2=sell
-            buy_vol = volume[direction == 1].sum()
-            sell_vol = volume[direction == 2].sum()
-            net = buy_vol - sell_vol
-        total_vol = volume.sum()
-        result['NET_ORDER_FLOW'] = float(net / total_vol) if total_vol > 0 else 0.0
 
-    return result
-
+# ---------------------------------------------------------------------------
+# Level2StockData
+# ---------------------------------------------------------------------------
 
 class Level2StockData:
     """
     Drop-in replacement for alphagen_qlib.StockData using local Level 2 HDF5 data.
 
-    Interface contract (same as StockData):
-      - self.data: Tensor of shape (total_days, n_features, n_stocks)
-        where total_days = n_days + max_backtrack_days + max_future_days
-      - self.n_days, self.n_features, self.n_stocks: int properties
+    Interface contract (duck-type compatible with StockData):
+      - self.data: Tensor (total_days, n_features, n_stocks)
+      - self.n_days, self.n_features, self.n_stocks
       - self.stock_ids: pd.Index
-      - self.max_backtrack_days, self.max_future_days: int
-      - self.device: torch.device
-      - __getitem__(slice) -> Level2StockData  (date slicing)
-      - make_dataframe(...) -> pd.DataFrame
+      - self.max_backtrack_days, self.max_future_days, self.device
+      - __getitem__(slice), make_dataframe(...)
     """
 
     def __init__(
@@ -306,6 +350,8 @@ class Level2StockData:
         features: Optional[List[Level2FeatureType]] = None,
         device: torch.device = torch.device("cuda:0"),
         data_root: str = "~/EquityLevel2/stock",
+        cache_dir: Optional[str] = None,
+        max_workers: int = 4,
         preloaded_data: Optional[Tuple[torch.Tensor, pd.Index, pd.Index]] = None,
     ) -> None:
         self._instrument = instrument
@@ -316,50 +362,79 @@ class Level2StockData:
         self._features = features if features is not None else list(Level2FeatureType)
         self.device = device
         self._data_root = data_root
+        self._cache_dir = cache_dir
+        self._max_workers = max_workers
 
         if preloaded_data is not None:
             self.data, self._dates, self._stock_ids = preloaded_data
         else:
             self.data, self._dates, self._stock_ids = self._load_data()
 
+    def _cache_key(self) -> str:
+        """Generate a unique cache key for the current configuration."""
+        key_str = f"{self._instrument}|{self._start_time}|{self._end_time}|" \
+                  f"{self.max_backtrack_days}|{self.max_future_days}|" \
+                  f"{[int(f) for f in self._features]}"
+        return hashlib.md5(key_str.encode()).hexdigest()
+
+    def _try_load_cache(self) -> Optional[Tuple[torch.Tensor, pd.Index, pd.Index]]:
+        if self._cache_dir is None:
+            return None
+        cache_path = os.path.join(self._cache_dir, f"l2cache_{self._cache_key()}.pkl")
+        if os.path.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                data = pickle.load(f)
+            return (data['tensor'].to(self.device), data['dates'], data['stock_ids'])
+        return None
+
+    def _save_cache(self, tensor: torch.Tensor, dates: pd.Index, stock_ids: pd.Index):
+        if self._cache_dir is None:
+            return
+        os.makedirs(self._cache_dir, exist_ok=True)
+        cache_path = os.path.join(self._cache_dir, f"l2cache_{self._cache_key()}.pkl")
+        with open(cache_path, 'wb') as f:
+            pickle.dump({'tensor': tensor.cpu(), 'dates': dates, 'stock_ids': stock_ids}, f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+
     def _load_data(self) -> Tuple[torch.Tensor, pd.Index, pd.Index]:
-        """Load and aggregate Level 2 data into the standard tensor format."""
-        reader = Level2HDF5Reader(self._data_root)
+        # Try cache first
+        cached = self._try_load_cache()
+        if cached is not None:
+            return cached
+
+        reader = Level2HDF5Reader(self._data_root, max_workers=self._max_workers)
         try:
-            return self._build_tensor(reader)
+            result = self._build_tensor(reader)
+            self._save_cache(*result)
+            return result
         finally:
             reader.close()
 
     def _build_tensor(self, reader: Level2HDF5Reader) -> Tuple[torch.Tensor, pd.Index, pd.Index]:
-        # Determine the date range with backtrack/future margins
         all_dates = reader.common_dates()
         if not all_dates:
-            # Fallback: try tick dates only
             all_dates = reader.available_dates('tick')
         if not all_dates:
             raise FileNotFoundError(
-                f"No HDF5 data files found in {self._data_root}. "
-                f"Expected structure: {{data_root}}/tick/YYYYMMDD.h5"
+                f"No HDF5 data found in {self._data_root}. "
+                f"Expected: {{data_root}}/tick/YYYYMMDD.h5"
             )
 
         start_ts = pd.Timestamp(self._start_time)
         end_ts = pd.Timestamp(self._end_time)
         date_timestamps = pd.DatetimeIndex([pd.Timestamp(d) for d in all_dates])
 
-        # Find indices for the requested range
         start_idx = date_timestamps.searchsorted(start_ts)
         end_idx = date_timestamps.searchsorted(end_ts, side='right') - 1
         if end_idx < start_idx:
-            raise ValueError(f"No data found in range [{self._start_time}, {self._end_time}]")
+            raise ValueError(f"No data in range [{self._start_time}, {self._end_time}]")
 
-        # Expand range for backtrack and future margins
         real_start_idx = max(0, start_idx - self.max_backtrack_days)
         real_end_idx = min(len(all_dates) - 1, end_idx + self.max_future_days)
 
         selected_dates = all_dates[real_start_idx:real_end_idx + 1]
         date_index = pd.DatetimeIndex([pd.Timestamp(d) for d in selected_dates])
 
-        # Determine stock universe
         stock_codes = self._resolve_stocks(reader, selected_dates)
         if not stock_codes:
             raise ValueError("No stocks found in the data for the given date range")
@@ -369,78 +444,78 @@ class Level2StockData:
         n_features = len(self._features)
         n_stocks = len(stock_codes)
 
-        # Pre-allocate with NaN
-        values = np.full((n_dates, n_features, n_stocks), np.nan, dtype=np.float32)
-
-        # Feature name to index mapping
+        # Feature name -> column index
         feat_idx = {f.name: i for i, f in enumerate(self._features)}
 
-        # Load data date by date
-        for d_idx, date_str in enumerate(selected_dates):
-            # Read tick data for all stocks at once
-            has_tick = os.path.exists(reader._get_h5_path('tick', date_str))
-            has_txn = os.path.exists(reader._get_h5_path('transaction', date_str))
-            has_order = os.path.exists(reader._get_h5_path('order', date_str))
+        # Pre-allocate with NaN (float32 for GPU efficiency)
+        values = np.full((n_dates, n_features, n_stocks), np.nan, dtype=np.float32)
 
-            tick_batch = reader.read_stocks_batch('tick', date_str, stock_codes) if has_tick else {}
-            txn_batch = reader.read_stocks_batch('transaction', date_str, stock_codes) if has_txn else {}
-            order_batch = reader.read_stocks_batch('order', date_str, stock_codes) if has_order else {}
+        # --- Parallel date loading ---
+        def process_date(d_idx_date):
+            d_idx, date_str = d_idx_date
+            day_data = reader.read_date_all_categories(date_str, stock_codes)
+            day_values = np.full((n_features, n_stocks), np.nan, dtype=np.float32)
 
             for s_idx, code in enumerate(stock_codes):
-                # Aggregate tick data
-                tick_d = tick_batch.get(code, {})
+                # Tick aggregation
+                tick_d = day_data.get('tick', {}).get(code, {})
                 if tick_d:
-                    agg = _aggregate_tick_daily(tick_d)
-                    for feat_name, val in agg.items():
-                        if feat_name in feat_idx:
-                            values[d_idx, feat_idx[feat_name], s_idx] = val
+                    for fname, val in _aggregate_tick_daily(tick_d).items():
+                        if fname in feat_idx:
+                            day_values[feat_idx[fname], s_idx] = val
 
-                # Aggregate transaction data
-                txn_d = txn_batch.get(code, {})
+                # Transaction aggregation
+                txn_d = day_data.get('transaction', {}).get(code, {})
                 if txn_d:
-                    agg = _aggregate_transaction_daily(txn_d)
-                    for feat_name, val in agg.items():
-                        if feat_name in feat_idx:
-                            values[d_idx, feat_idx[feat_name], s_idx] = val
+                    for fname, val in _aggregate_transaction_daily(txn_d).items():
+                        if fname in feat_idx:
+                            day_values[feat_idx[fname], s_idx] = val
 
-                # Aggregate order data
-                order_d = order_batch.get(code, {})
-                if order_d:
-                    agg = _aggregate_order_daily(order_d)
-                    for feat_name, val in agg.items():
-                        if feat_name in feat_idx:
-                            values[d_idx, feat_idx[feat_name], s_idx] = val
+                # Order aggregation
+                ord_d = day_data.get('order', {}).get(code, {})
+                if ord_d:
+                    for fname, val in _aggregate_order_daily(ord_d).items():
+                        if fname in feat_idx:
+                            day_values[feat_idx[fname], s_idx] = val
+
+            return d_idx, day_values
+
+        # Use ThreadPool for IO-bound HDF5 reads (GIL released during h5py reads)
+        if self._max_workers > 1 and n_dates > 10:
+            with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+                futures = [pool.submit(process_date, (i, d)) for i, d in enumerate(selected_dates)]
+                for future in futures:
+                    d_idx, day_vals = future.result()
+                    values[d_idx] = day_vals
+        else:
+            for i, d in enumerate(selected_dates):
+                d_idx, day_vals = process_date((i, d))
+                values[d_idx] = day_vals
 
         tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
         return tensor, date_index, stock_ids
 
     def _resolve_stocks(self, reader: Level2HDF5Reader, dates: List[str]) -> List[str]:
-        """Determine the stock universe from the data or instrument config."""
         if isinstance(self._instrument, list):
-            # Explicit stock list provided
             return [code.lower() for code in self._instrument]
 
-        # Auto-discover stocks from data: use the intersection of stocks
-        # across a sample of dates (ensures all stocks have data for most dates)
+        # Auto-discover: intersection of stocks across sampled dates
         sample_dates = dates[::max(1, len(dates) // 10)][:10]
         stock_sets = []
         for date_str in sample_dates:
             stocks = set(reader.available_stocks('tick', date_str))
             if stocks:
                 stock_sets.append(stocks)
-
         if not stock_sets:
             return []
-
-        # Use intersection so we only get stocks with consistent data
-        common_stocks = stock_sets[0]
+        common = stock_sets[0]
         for s in stock_sets[1:]:
-            common_stocks &= s
+            common &= s
+        return sorted(common)
 
-        return sorted(common_stocks)
+    # ----- Interface (duck-type compatible with StockData) -----
 
     def __getitem__(self, slc: slice) -> "Level2StockData":
-        """Get a subview of the data given a date slice or an index slice."""
         if slc.step is not None:
             raise ValueError("Only support slice with step=None")
         if isinstance(slc.start, str):
@@ -452,7 +527,6 @@ class Level2StockData:
         stop = min(self.data.shape[0], stop)
         idx_range = slice(start, stop)
         data = self.data[idx_range]
-        # Remove stocks that are all NaN in this slice
         remaining = data.isnan().reshape(-1, data.shape[-1]).all(dim=0).logical_not().nonzero().flatten()
         data = data[:, :, remaining]
         return Level2StockData(
@@ -474,7 +548,7 @@ class Level2StockData:
             idx += 1
         idx -= self.max_backtrack_days
         if idx < 0 or idx > self.n_days:
-            raise ValueError(f"Date {date} is out of range: available [{self._start_time}, {self._end_time}]")
+            raise ValueError(f"Date {date} is out of range: [{self._start_time}, {self._end_time}]")
         return idx
 
     def find_date_slice(self, start_time: Optional[str] = None, end_time: Optional[str] = None) -> slice:
@@ -511,14 +585,9 @@ class Level2StockData:
             columns = [str(i) for i in range(data.shape[2])]
         n_days, n_stocks, n_columns = data.shape
         if self.n_days != n_days:
-            raise ValueError(f"number of days in the provided tensor ({n_days}) doesn't "
-                             f"match that of the current StockData ({self.n_days})")
+            raise ValueError(f"n_days mismatch: tensor {n_days} vs data {self.n_days}")
         if self.n_stocks != n_stocks:
-            raise ValueError(f"number of stocks in the provided tensor ({n_stocks}) doesn't "
-                             f"match that of the current StockData ({self.n_stocks})")
-        if len(columns) != n_columns:
-            raise ValueError(f"size of columns ({len(columns)}) doesn't match with "
-                             f"tensor feature count ({data.shape[2]})")
+            raise ValueError(f"n_stocks mismatch: tensor {n_stocks} vs data {self.n_stocks}")
         if self.max_future_days == 0:
             date_index = self._dates[self.max_backtrack_days:]
         else:
