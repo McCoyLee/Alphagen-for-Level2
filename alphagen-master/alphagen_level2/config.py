@@ -1,7 +1,8 @@
 """
 Configuration for Level 2 alpha generation.
 
-Extends the base config with Level 2 features available in the action space.
+Bar mode: DELTA_TIMES are in units of bars (not days).
+For 3min bars: 5 bars = 15min, 20 bars = 1h, 80 bars ≈ 1 day.
 """
 
 from typing import Type, List
@@ -26,7 +27,9 @@ OPERATORS: List[Type[Operator]] = [
     Cov, Corr
 ]
 
-DELTA_TIMES = [1, 5, 10, 20, 40]
+# Bar-level delta times (units = bars)
+# For 3min bars: 5=15min, 10=30min, 20=1h, 40=2h, 80≈1day
+DELTA_TIMES = [5, 10, 20, 40, 80]
 
 CONSTANTS = [-30., -10., -5., -2., -1., -0.5, -0.01, 0.01, 0.5, 1., 2., 5., 10., 30.]
 
