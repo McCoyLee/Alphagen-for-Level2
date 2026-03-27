@@ -1,9 +1,19 @@
 # Level 2 本地数据集成 — 变更说明
-
+## 零、核心架构：Bar-level 计算
+Show less
+**本系统采用 bar-level（N 分钟 K 线）计算，而非日频聚合。**
+```
+Tick 快照（~4832/日）→ 3min K 线（~80 bars/日）→ 表达式/RL 以 bar 为时间单位
+```
+关键设计：
+- 时间轴是连续的 bars，不是 days。`data.data` 的 dim0 是 bar 索引
+- 表达式系统的 `Rolling(x, 5)` 意味着"过去 5 个 bar"（= 15 分钟），而不是"过去 5 天"
+- `max_backtrack_days` 和 `max_future_days` 的单位实际上是 **bars**（接口名保持不变以兼容）
+- 对于 3min bars：80 bars ≈ 1 交易日（240min / 3min = 80）
+- `DELTA_TIMES = [5, 10, 20, 40, 80]` 对应 15min, 30min, 1h, 2h, ~1day
+---
 ## 一、数据格式说明
-
 ### 目录结构
-
 ```
 ~/EquityLevel2/stock/
 ├── order/
@@ -55,21 +65,15 @@
             ├── Volume         {N}      成交数量
             └── Time           {N}      时间戳
 ```
-
 ### 数据量级（单日单股参考）
-
 | 类别 | 典型记录数 | 说明 |
 |------|-----------|------|
 | tick | ~4,832 | 3 秒快照，含 10 档盘口 2D 数组 |
 | transaction | ~135,706 | 逐笔成交 |
 | order | ~19,277 | 逐笔委托 |
-
 ---
-
 ## 二、改了什么
-
 ### 新增文件
-
 | 文件 | 职责 |
 |------|------|
 | `alphagen_level2/__init__.py` | 包入口 |
@@ -80,88 +84,68 @@
 | `alphagen_level2/env_wrapper.py` | `Level2EnvWrapper`：支持 20 维特征的 RL 动作空间 |
 | `alphagen_level2/features.py` | 20 个特征变量定义 |
 | `scripts/rl_level2.py` | 训练入口脚本 |
-
 **原有代码零修改。**
-
 ---
-
 ## 三、特征定义（20 维）
-
 ### 3.1 基础特征（索引 0-5，与原系统兼容）
-
-| 索引 | 名称 | 来源 | 聚合逻辑 |
+每个 bar（3min 窗口）内从 tick 快照聚合：
+| 索引 | 名称 | 来源 | 聚合逻辑（per bar） |
 |------|------|------|---------|
-| 0 | OPEN | tick.Open | `Open[0]`（首个有效快照） |
-| 1 | CLOSE | tick.Price | `Price[-1]`（最后有效快照） |
-| 2 | HIGH | tick.High | `High[-1]`（快照维护的日内最高价） |
-| 3 | LOW | tick.Low | `Low[-1]`（快照维护的日内最低价） |
-| 4 | VOLUME | tick.AccVolume | `AccVolume[-1]`（当日累计成交量） |
-| 5 | VWAP | tick.AccTurnover/AccVolume | `AccTurnover[-1] / AccVolume[-1]` |
-
+| 0 | OPEN | tick.Price | bar 内首个 tick 的 Price |
+| 1 | CLOSE | tick.Price | bar 内末个 tick 的 Price |
+| 2 | HIGH | tick.Price | bar 内 max(Price) |
+| 3 | LOW | tick.Price | bar 内 min(Price) |
+| 4 | VOLUME | tick.Volume | bar 内 sum(Volume) |
+| 5 | VWAP | tick.Price × Volume | `Σ(P×V) / ΣV` |
 ### 3.2 盘口特征（索引 6-12，从 tick 10 档数据聚合）
-
-| 索引 | 名称 | 聚合逻辑 |
+| 索引 | 名称 | 聚合逻辑（per bar） |
 |------|------|---------|
-| 6 | BID_ASK_SPREAD | `mean(AskPrice10[:,0] - BidPrice10[:,0])` |
-| 7 | BID_ASK_SPREAD_PCT | `mean(spread / mid)` |
-| 8 | MID_PRICE | `mean((Ask1 + Bid1) / 2)` |
-| 9 | WEIGHTED_BID | 每快照 10 档买量加权均价，取日均 |
-| 10 | WEIGHTED_ASK | 每快照 10 档卖量加权均价，取日均 |
-| 11 | ORDER_IMBALANCE | `mean((TBV - TAV) / (TBV + TAV))`，用 TotalBidVolume/TotalAskVolume |
-| 12 | DEPTH_IMBALANCE | `mean((Σbid_vol_10 - Σask_vol_10) / total)`，10 档汇总 |
-
+| 6 | BID_ASK_SPREAD | bar 内 `mean(AskPrice10[:,0] - BidPrice10[:,0])` |
+| 7 | BID_ASK_SPREAD_PCT | bar 内 `mean(spread / mid)` |
+| 8 | MID_PRICE | bar 内 `mean((Ask1 + Bid1) / 2)` |
+| 9 | WEIGHTED_BID | bar 内每 tick 10 档买量加权均价的均值 |
+| 10 | WEIGHTED_ASK | bar 内每 tick 10 档卖量加权均价的均值 |
+| 11 | ORDER_IMBALANCE | bar 内 `mean((TBV - TAV) / (TBV + TAV))` |
+| 12 | DEPTH_IMBALANCE | bar 内 10 档总量不平衡均值 |
 ### 3.3 成交特征（索引 13-17，从 transaction 聚合）
-
-| 索引 | 名称 | 聚合逻辑 |
+| 索引 | 名称 | 聚合逻辑（per bar） |
 |------|------|---------|
-| 13 | TXN_VOLUME | 实际成交量（`FunctionCode==0` 过滤掉撤单） |
-| 14 | TXN_VWAP | 实际成交 VWAP |
-| 15 | BUY_RATIO | **直接用 BSFlag**：`sum(vol[BSFlag=='B']) / total_vol` |
-| 16 | LARGE_ORDER_RATIO | `sum(vol[vol >= P90]) / total_vol` |
-| 17 | TXN_COUNT | 实际成交笔数 |
-
+| 13 | TXN_VOLUME | bar 内实际成交量（`FunctionCode==0` 过滤撤单） |
+| 14 | TXN_VWAP | bar 内实际成交 VWAP |
+| 15 | BUY_RATIO | bar 内 `sum(vol[BSFlag=='B']) / total_vol` |
+| 16 | LARGE_ORDER_RATIO | bar 内 `sum(vol[vol >= P90]) / total_vol` |
+| 17 | TXN_COUNT | bar 内实际成交笔数 |
 ### 3.4 委托特征（索引 18-19，从 order 聚合）
-
-| 索引 | 名称 | 聚合逻辑 |
+| 索引 | 名称 | 聚合逻辑（per bar） |
 |------|------|---------|
-| 18 | ORDER_CANCEL_RATIO | `count(OrderKind=='D') / total_orders` |
-| 19 | NET_ORDER_FLOW | `(vol[FunctionCode=='B'] - vol[FunctionCode=='S']) / total_vol` |
-
+| 18 | ORDER_CANCEL_RATIO | bar 内 `count(OrderKind=='D') / total_orders` |
+| 19 | NET_ORDER_FLOW | bar 内 `(vol[FunctionCode=='B'] - vol[FunctionCode=='S']) / total_vol` |
 ---
-
 ## 四、为什么这样改
-
 ### 4.1 vs 上一版的修正
-
 | 问题 | 上一版（错误） | 本版（正确） |
 |------|--------------|------------|
+| **时间粒度** | 日频聚合（每日 1 行） | Bar-level 聚合（每日 ~80 行 @3min） |
 | 盘口档位 | `BidPrice1..5`（5 个 1D 字段） | `BidPrice10` shape `(N,10)` 一个 2D 数组 |
-| OHLC | 从 Price 数组手动计算 `first/max/min/last` | 直接用 tick 快照的 `Open/High/Low` 字段 |
-| 成交量 | `sum(Volume)` 逐 tick 累加 | `AccVolume[-1]`（当日累计，精确无重复） |
-| VWAP | 手动算 `Σ(P×V)/ΣV` | `AccTurnover[-1] / AccVolume[-1]`（交易所精度） |
+| OHLC | 从日内 Open/High/Low 快照字段取值 | 从 bar 内 tick Price 计算 OHLC |
+| 成交量 | `AccVolume[-1]` 日累计 | bar 内 `sum(Volume)` |
+| VWAP | `AccTurnover[-1] / AccVolume[-1]` | bar 内 `Σ(P×V) / ΣV` |
 | 主买判断 | tick rule（价格变动方向推断） | 直接用 `BSFlag` 字段（B/S 明确标记） |
 | 撤单检测 | 查找不存在的 `OrderType==2` | 用 `OrderKind=='D'` |
 | 买卖方向 | 查找不存在的 `Direction` 字段 | 用 `FunctionCode=='B'/'S'` |
 | 字符串字段 | 未处理 HDF5 bytes 编码 | `match_char()` 统一处理 `b'B'`/`ord('B')`/`'B'` |
-
 ### 4.2 为什么不修改原有代码
-
 `Level2StockData` 实现了与 `StockData` 完全相同的 duck-typing 接口：
-
 ```python
 data.data[start:stop, int(feature), :]   # Feature.evaluate() 中的张量索引
-data.max_backtrack_days / max_future_days # 回溯/前瞻天数
-data.n_days / n_stocks / n_features       # 维度属性
+data.max_backtrack_days / max_future_days # 回溯/前瞻（单位是 bars，但属性名保持兼容）
+data.n_days / n_stocks / n_features       # n_days 实际返回 n_bars
 ```
-
 表达式系统（`Expression`）、算子（`Operator`）、RL 环境（`AlphaEnvCore`）全部无需修改。
-
+关键洞察：**表达式系统只关心 dim0 的索引，不关心它代表"天"还是"bar"。**
 ---
-
 ## 五、性能优化
-
 ### 5.1 已实现的优化
-
 | 优化 | 位置 | 效果 |
 |------|------|------|
 | **Pickle 缓存** | `Level2StockData(cache_dir=...)` | 首次聚合后缓存，后续加载 <1s（vs 分钟级） |
@@ -170,99 +154,90 @@ data.n_days / n_stocks / n_features       # 维度属性
 | **2D 向量化** | `(bp * bv).sum(axis=1)` | 10 档加权均价一行 numpy，无 Python 循环 |
 | **文件句柄缓存** | `_file_cache` | 避免重复 open/close 同一 .h5 文件 |
 | **智能过滤** | `FunctionCode==0` | transaction 先过滤撤单再聚合，减少无效计算 |
-
 ### 5.2 使用缓存
-
 ```bash
 # 首次运行：读取 HDF5 并聚合（较慢，取决于数据量）
 python scripts/rl_level2.py --cache_dir=./out/l2_cache ...
-
 # 后续运行：直接读 pickle 缓存（<1秒）
 python scripts/rl_level2.py --cache_dir=./out/l2_cache ...
-
 # 禁用缓存（数据更新后需要重新聚合）
 python scripts/rl_level2.py --cache_dir=None ...
 ```
-
 ### 5.3 进一步优化建议（需要重构）
-
 以下是当前架构下仍可改进的方向，按优先级排序：
-
 #### P0：瓶颈分析
-
 当前系统的性能瓶颈分布：
-
 ```
-┌─────────────────────────────────────────────────────┐
-│ 阶段                  │ 首次    │ 缓存后  │ 瓶颈    │
-│───────────────────────│─────────│─────────│─────────│
-│ HDF5 读取 (IO)        │ 60-80%  │   0%    │ IO      │
-│ 日内聚合 (CPU)        │ 15-30%  │   0%    │ CPU     │
-│ Expression eval (GPU) │  5-10%  │  70%    │ GPU     │
-│ RL step (GPU)         │  <5%    │  30%    │ GPU     │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│ 阶段                   │ 首次    │ 缓存后  │ 瓶颈    │
+│────────────────────────│─────────│─────────│─────────│
+│ HDF5 读取 (IO)         │ 60-80%  │   0%    │ IO      │
+│ Bar 级聚合 (CPU)       │ 15-30%  │   0%    │ CPU     │
+│ Expression eval (GPU)  │  5-10%  │  70%    │ GPU     │
+│ RL step (GPU)          │  <5%    │  30%    │ GPU     │
+└──────────────────────────────────────────────────────┘
 ```
-
-**结论**：使用 pickle 缓存后，IO 和聚合成本归零；剩余瓶颈在 GPU 端的表达式求值，这部分已经是 PyTorch 向量化操作，优化空间有限。
-
+**注意**：Bar 模式下 tensor dim0 更大（~80x vs 日频），GPU 端 Expression eval 耗时会增加。
+使用 pickle 缓存后，IO 和聚合成本归零；剩余瓶颈在 GPU 端的表达式求值。
 #### P1：如果需要更大规模数据
-
 | 方向 | 描述 | 预计收益 |
 |------|------|---------|
 | **预聚合工具** | 写一个离线脚本，将 HDF5 聚合结果存为 `daily_features.parquet`，后续直接读 | 10-100x IO 加速 |
 | **内存映射** | 对超大数据集，用 `np.memmap` 替代全量加载 | 减少内存占用 |
 | **分片读取** | 按股票分片并行处理，而非按日期 | 对 >1000 股有效 |
-
 #### P2：计算密集场景
-
 | 方向 | 描述 | 预计收益 |
 |------|------|---------|
 | **GPU 聚合** | 将日内聚合搬到 GPU（`cupy` 或 `torch`） | 对大 tick 数据 2-5x |
 | **JIT 编译** | 用 `numba.jit` 加速聚合函数 | 对 CPU 聚合 3-10x |
 | **Expression 缓存** | 缓存常用子表达式的求值结果 | 减少重复计算 |
-
 #### P3：架构级优化（大改动）
-
 | 方向 | 描述 | 何时需要 |
 |------|------|---------|
 | **流式聚合** | 不预聚合为日频，直接在 tick 级别做滚动计算 | 需要 tick 级别的 alpha |
 | **Arrow/Parquet 替换 HDF5** | 列式存储，更适合批量读取少量字段 | 数据重建时 |
 | **分布式计算** | Dask/Ray 多机并行 | >10TB 数据 |
-
 ---
-
 ## 六、使用方式
-
-### 基本用法
-
+### 基本用法（3min bars）
 ```bash
-# 从 Level 2 数据提取 OHLCV 训练（6 维特征，与原系统兼容）
+# OHLCV 训练（6 维特征，3min bars，默认）
 python scripts/rl_level2.py \
     --data_root=~/EquityLevel2/stock \
     --train_start=2022-01-05 --train_end=2022-09-30 \
     --valid_start=2022-10-01 --valid_end=2022-11-30 \
     --test_start=2022-12-01 --test_end=2022-12-31
-
-# Level 2 全特征训练（20 维特征）
+# Level 2 全特征训练（20 维特征，3min bars）
 python scripts/rl_level2.py \
     --data_root=~/EquityLevel2/stock \
     --use_level2_features \
     --pool_capacity=20
-
+# 5 分钟 bars
+python scripts/rl_level2.py \
+    --data_root=~/EquityLevel2/stock \
+    --bar_size_min=5
+# 自定义 lookback/forward（单位：bars）
+# 160 bars @3min ≈ 2 天回溯
+python scripts/rl_level2.py \
+    --data_root=~/EquityLevel2/stock \
+    --max_backtrack_bars=160 --max_future_bars=80
 # 指定股票 + 并行加载
 python scripts/rl_level2.py \
     --data_root=~/EquityLevel2/stock \
     --instruments='["000001.sz","000002.sz"]' \
     --max_workers=8
 ```
-
+### Bar 参数对照表
+| bar_size_min | bars/day | 80 bars = | DELTA_TIMES 含义 |
+|-------------|----------|-----------|-----------------|
+| 1 | 240 | 20min | 5/10/20/40/80 min |
+| 3 (默认) | 80 | 1 day | 15min/30min/1h/2h/1day |
+| 5 | 48 | ~1.7h | 25min/50min/100min/... |
 ### 代码中使用
-
 ```python
 from alphagen_level2 import Level2StockData, Level2Calculator, Level2FeatureType
 from alphagen.data.expression import Feature, Mean, Ref
-
-# 加载数据（自动缓存）
+# 加载数据（3min bars，自动缓存）
 data = Level2StockData(
     instrument=["000001.sz", "000002.sz"],
     start_time="2022-01-05",
@@ -270,27 +245,24 @@ data = Level2StockData(
     data_root="~/EquityLevel2/stock",
     cache_dir="./out/l2_cache",
     max_workers=4,
+    bar_size_min=3,        # 3 分钟 K 线
+    max_backtrack_days=80,  # 80 bars 回溯（实际是 bars，属性名保持兼容）
+    max_future_days=80,     # 80 bars 前瞻
 )
-
 # 用 Level 2 特征构建 alpha
 oi = Feature(Level2FeatureType.ORDER_IMBALANCE)
-alpha = Mean(oi, 5)  # 5 日滚动订单不平衡
-
+alpha = Mean(oi, 5)  # 5 bars 滚动订单不平衡（= 15 分钟）
 # 计算 IC
 close = Feature(Level2FeatureType.CLOSE)
-target = Ref(close, -20) / close - 1
+target = Ref(close, -80) / close - 1  # 80 bars ≈ 1 天的未来收益
 calc = Level2Calculator(data, target)
 print(f"IC = {calc.calc_single_IC_ret(alpha):.4f}")
 ```
-
 ---
-
 ## 七、依赖变更
-
 新增：`h5py`
-
 ```bash
 pip install h5py
-```
+
 
 原有依赖不变。**Level 2 训练不再需要 qlib 和 baostock。**

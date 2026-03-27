@@ -1,18 +1,14 @@
 """
 Configuration for Level 2 alpha generation.
-
+Show less
 Bar mode: DELTA_TIMES are in units of bars (not days).
 For 3min bars: 5 bars = 15min, 20 bars = 1h, 80 bars ≈ 1 day.
 """
-
 from typing import Type, List
 from alphagen.data.expression import *
 from alphagen_level2.stock_data import Level2FeatureType
-
-
 MAX_EXPR_LENGTH = 15
 MAX_EPISODE_LENGTH = 256
-
 OPERATORS: List[Type[Operator]] = [
     # Unary
     Abs, Log,
@@ -26,18 +22,13 @@ OPERATORS: List[Type[Operator]] = [
     # Pair rolling
     Cov, Corr
 ]
-
 # Bar-level delta times (units = bars)
 # For 3min bars: 5=15min, 10=30min, 20=1h, 40=2h, 80≈1day
 DELTA_TIMES = [5, 10, 20, 40, 80]
-
 CONSTANTS = [-30., -10., -5., -2., -1., -0.5, -0.01, 0.01, 0.5, 1., 2., 5., 10., 30.]
-
 REWARD_PER_STEP = 0.
-
 # Level 2 feature set for the RL action space
 LEVEL2_FEATURES: List[Level2FeatureType] = list(Level2FeatureType)
-
 # Basic feature set (OHLCV + VWAP only) - compatible with original pipeline
 BASIC_FEATURES: List[Level2FeatureType] = [
     Level2FeatureType.OPEN,
@@ -47,3 +38,4 @@ BASIC_FEATURES: List[Level2FeatureType] = [
     Level2FeatureType.VOLUME,
     Level2FeatureType.VWAP,
 ]
+
