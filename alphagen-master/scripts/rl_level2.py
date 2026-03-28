@@ -36,34 +36,63 @@ from alphagen_level2.stock_data import Level2StockData, Level2FeatureType
 from alphagen_level2.calculator import Level2Calculator
 from alphagen_level2.env_wrapper import Level2AlphaEnv
 from alphagen_level2.config import BASIC_FEATURES, LEVEL2_FEATURES
+from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergence
 class Level2Callback(BaseCallback):
     def __init__(
         self,
         save_path: str,
         test_calculators: List[Level2Calculator],
         verbose: int = 0,
+        convergence_logger: Optional[ConvergenceLogger] = None,
+        plot_interval: int = 10,
     ):
         super().__init__(verbose)
         self.save_path = save_path
         self.test_calculators = test_calculators
+        self.conv_logger = convergence_logger
+        self._plot_interval = plot_interval
+        self._rollout_count = 0
         os.makedirs(self.save_path, exist_ok=True)
     def _on_step(self) -> bool:
         return True
     def _on_rollout_end(self) -> None:
-        self.logger.record('pool/size', self.pool.size)
-        self.logger.record('pool/significant', (np.abs(self.pool.weights[:self.pool.size]) > 1e-4).sum())
-        self.logger.record('pool/best_ic_ret', self.pool.best_ic_ret)
-        self.logger.record('pool/eval_cnt', self.pool.eval_cnt)
+        self._rollout_count += 1
+        pool = self.pool
+        sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
+        self.logger.record('pool/size', pool.size)
+        self.logger.record('pool/significant', sig_count)
+        self.logger.record('pool/best_ic_ret', pool.best_ic_ret)
+        self.logger.record('pool/eval_cnt', pool.eval_cnt)
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
+        test_results = []
         for i, test_calc in enumerate(self.test_calculators, start=1):
-            ic_test, rank_ic_test = self.pool.test_ensemble(test_calc)
+            ic_test, rank_ic_test = pool.test_ensemble(test_calc)
+            test_results.append((ic_test, rank_ic_test))
             ic_test_mean += ic_test * test_calc.data.n_days / n_days
             rank_ic_test_mean += rank_ic_test * test_calc.data.n_days / n_days
             self.logger.record(f'test/ic_{i}', ic_test)
             self.logger.record(f'test/rank_ic_{i}', rank_ic_test)
         self.logger.record('test/ic_mean', ic_test_mean)
         self.logger.record('test/rank_ic_mean', rank_ic_test_mean)
+        # Record convergence metrics
+        if self.conv_logger is not None:
+            self.conv_logger.record_step(
+                timestep=self.num_timesteps,
+                pool_size=pool.size,
+                pool_significant=sig_count,
+                pool_best_ic=pool.best_ic_ret,
+                pool_eval_cnt=pool.eval_cnt,
+                train_ic=pool.best_ic_ret,
+                test_results=test_results,
+            )
+            self.conv_logger.save_csv()
+            if self._rollout_count % self._plot_interval == 0:
+                try:
+                    csv_path = os.path.join(self.conv_logger.save_dir, "convergence.csv")
+                    plot_convergence(csv_path)
+                except Exception:
+                    pass
         self.save_checkpoint()
     def save_checkpoint(self):
         path = os.path.join(self.save_path, f'{self.num_timesteps}_steps')
@@ -165,10 +194,12 @@ def run_single_experiment(
         device=device,
         print_expr=True,
     )
+    conv_logger = ConvergenceLogger(save_dir=save_path)
     callback = Level2Callback(
         save_path=save_path,
         test_calculators=calculators[1:],
         verbose=1,
+        convergence_logger=conv_logger,
     )
     model = MaskablePPO(
         "MlpPolicy",
@@ -195,6 +226,18 @@ def run_single_experiment(
         callback=callback,
         tb_log_name=name_prefix,
     )
+    # Save final convergence data
+    csv_path = conv_logger.save_csv()
+    conv_logger.save_json()
+    try:
+        plot_path = plot_convergence(csv_path)
+        print(f"[Level2] Convergence plot: {plot_path}")
+    except Exception as e:
+        print(f"[Level2] Plot failed: {e}")
+    summary = conv_logger.summary()
+    if summary:
+        print(f"[Level2] Best pool IC: {summary['best_pool_ic']:.4f} (step {summary['best_pool_ic_step']})")
+        print(f"[Level2] Best test IC mean: {summary['best_test_ic_mean']:.4f} (step {summary['best_test_ic_mean_step']})")
     print(f"[Level2] Training complete. Results saved to {save_path}")
 def main(
     random_seeds: Union[int, Tuple[int]] = 0,
