@@ -1,31 +1,31 @@
 """
 RL training convergence logger & plotter.
-
+ 
 Records training metrics at each rollout end and provides:
 - CSV export for post-hoc analysis
 - Matplotlib convergence curve plotting
 - Integration as a callback mixin for SB3
-
+ 
 Usage standalone:
     from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergence
     logger = ConvergenceLogger(save_dir="./out/results/my_run")
     # ... during training, call logger.record_step(...)
     logger.save_csv()
     plot_convergence("./out/results/my_run/convergence.csv")
-
+ 
 Usage as callback (see ConvergenceCallback):
     callback = ConvergenceCallback(save_path=..., test_calculators=..., plot_interval=10)
 """
-
+ 
 import os
 import csv
 import json
 from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass, field, asdict
-
+ 
 import numpy as np
-
-
+ 
+ 
 @dataclass
 class StepRecord:
     """Single training step metrics snapshot."""
@@ -44,29 +44,29 @@ class StepRecord:
     test_rank_ic_mean: float = 0.0
     # Per-test-set breakdown (variable length, stored as JSON string)
     test_details: str = ""
-
-
+ 
+ 
 class ConvergenceLogger:
     """
     Accumulates training metrics and provides CSV/JSON export + plotting.
-
+ 
     Attributes:
         records: list of StepRecord objects
         save_dir: directory for output files
     """
-
+ 
     COLUMNS = [
         "timestep", "pool_size", "pool_significant", "pool_best_ic",
         "pool_eval_cnt", "train_ic", "train_rank_ic",
         "valid_ic", "valid_rank_ic", "test_ic", "test_rank_ic",
         "test_ic_mean", "test_rank_ic_mean", "test_details",
     ]
-
+ 
     def __init__(self, save_dir: str):
         self.save_dir = save_dir
         self.records: List[StepRecord] = []
         os.makedirs(save_dir, exist_ok=True)
-
+ 
     def record_step(
         self,
         timestep: int,
@@ -80,7 +80,7 @@ class ConvergenceLogger:
     ) -> StepRecord:
         """
         Record metrics for a single rollout end.
-
+ 
         Args:
             timestep: current training timestep
             pool_size: number of alphas in pool
@@ -91,12 +91,12 @@ class ConvergenceLogger:
             train_rank_ic: ensemble Rank IC on training set
             test_results: list of (ic, rank_ic) tuples per test calculator
                           Convention: [valid, test] or [test1, test2, ...]
-
+ 
         Returns:
             The recorded StepRecord
         """
         test_results = test_results or []
-
+ 
         # Weighted mean across test sets
         n_total = len(test_results)
         if n_total > 0:
@@ -104,13 +104,13 @@ class ConvergenceLogger:
             ric_mean = np.mean([t[1] for t in test_results])
         else:
             ic_mean, ric_mean = 0.0, 0.0
-
+ 
         # Separate valid vs test if convention is [valid, test, ...]
         valid_ic = test_results[0][0] if len(test_results) > 0 else 0.0
         valid_ric = test_results[0][1] if len(test_results) > 0 else 0.0
         test_ic = test_results[1][0] if len(test_results) > 1 else 0.0
         test_ric = test_results[1][1] if len(test_results) > 1 else 0.0
-
+ 
         rec = StepRecord(
             timestep=timestep,
             pool_size=pool_size,
@@ -129,7 +129,7 @@ class ConvergenceLogger:
         )
         self.records.append(rec)
         return rec
-
+ 
     def save_csv(self, filename: str = "convergence.csv") -> str:
         """Save all records to CSV. Returns the file path."""
         path = os.path.join(self.save_dir, filename)
@@ -139,20 +139,20 @@ class ConvergenceLogger:
             for rec in self.records:
                 writer.writerow(asdict(rec))
         return path
-
+ 
     def save_json(self, filename: str = "convergence.json") -> str:
         """Save all records to JSON. Returns the file path."""
         path = os.path.join(self.save_dir, filename)
         with open(path, "w") as f:
             json.dump([asdict(r) for r in self.records], f, indent=2)
         return path
-
+ 
     def get_series(self, key: str) -> Tuple[List[int], List[float]]:
         """Extract a metric time series. Returns (timesteps, values)."""
         steps = [r.timestep for r in self.records]
         values = [getattr(r, key) for r in self.records]
         return steps, values
-
+ 
     def summary(self) -> Dict[str, Any]:
         """Return summary statistics of the training run."""
         if not self.records:
@@ -171,8 +171,8 @@ class ConvergenceLogger:
             "best_test_ic_mean": self.records[best_test_idx].test_ic_mean,
             "best_test_ic_mean_step": self.records[best_test_idx].timestep,
         }
-
-
+ 
+ 
 def plot_convergence(
     csv_path: str,
     output_path: Optional[str] = None,
@@ -181,32 +181,32 @@ def plot_convergence(
 ) -> str:
     """
     Plot convergence curves from a CSV file.
-
+ 
     Generates a 2x2 figure:
       - Top-left: Pool Best IC (train) over steps
       - Top-right: Valid IC & Test IC over steps
       - Bottom-left: Pool Size & Significant Alphas over steps
       - Bottom-right: Eval Count over steps
-
+ 
     Args:
         csv_path: path to convergence.csv
         output_path: where to save the plot (default: same dir as csv, .png)
         show: whether to call plt.show()
         figsize: figure size
-
+ 
     Returns:
         Path to the saved plot image
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
+ 
     # Read CSV
     steps, pool_best_ic, valid_ic, test_ic = [], [], [], []
     pool_size, pool_sig, eval_cnt = [], [], []
     test_ic_mean, test_ric_mean = [], []
     valid_ric, test_ric = [], []
-
+ 
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -221,10 +221,10 @@ def plot_convergence(
             test_ric_mean.append(float(row["test_rank_ic_mean"]))
             valid_ric.append(float(row["valid_rank_ic"]))
             test_ric.append(float(row["test_rank_ic"]))
-
+ 
     fig, axes = plt.subplots(2, 2, figsize=figsize)
     fig.suptitle("RL Training Convergence", fontsize=14, fontweight="bold")
-
+ 
     # Top-left: Pool Best IC
     ax = axes[0, 0]
     ax.plot(steps, pool_best_ic, "b-", linewidth=1.5, label="Pool Best IC (Train)")
@@ -233,7 +233,7 @@ def plot_convergence(
     ax.set_title("Training IC Convergence")
     ax.legend()
     ax.grid(True, alpha=0.3)
-
+ 
     # Top-right: Valid & Test IC
     ax = axes[0, 1]
     ax.plot(steps, valid_ic, "g-", linewidth=1.2, label="Valid IC")
@@ -249,7 +249,7 @@ def plot_convergence(
     ax.legend(loc="upper left")
     ax2.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
-
+ 
     # Bottom-left: Pool Size
     ax = axes[1, 0]
     ax.plot(steps, pool_size, "b-", linewidth=1.2, label="Pool Size")
@@ -259,7 +259,7 @@ def plot_convergence(
     ax.set_title("Alpha Pool Growth")
     ax.legend()
     ax.grid(True, alpha=0.3)
-
+ 
     # Bottom-right: Eval Count
     ax = axes[1, 1]
     ax.plot(steps, eval_cnt, "purple", linewidth=1.2)
@@ -267,9 +267,9 @@ def plot_convergence(
     ax.set_ylabel("Eval Count")
     ax.set_title("Expressions Evaluated")
     ax.grid(True, alpha=0.3)
-
+ 
     plt.tight_layout()
-
+ 
     if output_path is None:
         output_path = csv_path.replace(".csv", ".png")
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
@@ -277,8 +277,8 @@ def plot_convergence(
         plt.show()
     plt.close(fig)
     return output_path
-
-
+ 
+ 
 def compare_runs(
     csv_paths: List[str],
     labels: Optional[List[str]] = None,
@@ -288,24 +288,24 @@ def compare_runs(
 ) -> str:
     """
     Compare convergence curves from multiple runs on the same plot.
-
+ 
     Args:
         csv_paths: list of convergence.csv paths
         labels: names for each run (defaults to filenames)
         output_path: where to save
         metric: which column to compare
         show: whether to plt.show()
-
+ 
     Returns:
         Path to the saved comparison plot
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
+ 
     if labels is None:
         labels = [os.path.basename(os.path.dirname(p)) for p in csv_paths]
-
+ 
     fig, ax = plt.subplots(figsize=(12, 6))
     for path, label in zip(csv_paths, labels):
         steps_list, values = [], []
@@ -315,7 +315,7 @@ def compare_runs(
                 steps_list.append(int(row["timestep"]))
                 values.append(float(row[metric]))
         ax.plot(steps_list, values, linewidth=1.2, label=label)
-
+ 
     ax.set_xlabel("Timestep")
     ax.set_ylabel(metric)
     ax.set_title(f"Comparison: {metric}")

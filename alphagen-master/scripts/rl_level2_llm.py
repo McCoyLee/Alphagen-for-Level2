@@ -1,49 +1,49 @@
 """
 RL + LLM alpha generation using local Level 2 HDF5 data.
-
+ 
 Supports three modes:
   1. Pure RL (default): same as rl_level2.py but with convergence logging
   2. LLM warm start (--llm_warmstart): LLM generates initial pool, then RL takes over
   3. LLM periodic assist (--use_llm): warm start + LLM replaces worst alphas every N steps
-
+ 
 Usage:
     # Pure RL with convergence curves:
     python scripts/rl_level2_llm.py --data_root=~/EquityLevel2/stock
-
+ 
     # LLM warm start only (LLM fills initial pool, then pure RL):
     python scripts/rl_level2_llm.py --data_root=~/EquityLevel2/stock --llm_warmstart
-
+ 
     # Full LLM assist (warm start + periodic replacement):
     python scripts/rl_level2_llm.py --data_root=~/EquityLevel2/stock --use_llm
-
+ 
     # With Level 2 extended features:
     python scripts/rl_level2_llm.py --data_root=~/EquityLevel2/stock --use_llm --use_level2_features
-
+ 
     # Custom LLM endpoint:
     python scripts/rl_level2_llm.py --data_root=~/EquityLevel2/stock --use_llm \\
         --llm_base_url=http://10.2.1.205:8796/v1 \\
         --llm_api_key=sk-xxx \\
         --llm_model=MiniMax-M2.5
 """
-
+ 
 import json
 import os
 from typing import Optional, Tuple, List, Union
 from datetime import datetime
-
+ 
 import numpy as np
 import torch
 import fire
 from sb3_contrib.ppo_mask import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback
-
+ 
 from alphagen.data.expression import *
 from alphagen.data.parser import ExpressionParser
 from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
-
+ 
 from alphagen_level2.stock_data import Level2StockData, Level2FeatureType
 from alphagen_level2.calculator import Level2Calculator
 from alphagen_level2.env_wrapper import Level2AlphaEnv
@@ -52,16 +52,16 @@ from alphagen_level2.config import (
 )
 from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergence
 from alphagen_level2.llm_prompts import get_level2_system_prompt
-
+ 
 from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
 from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
 from alphagen_llm.prompts.common import safe_parse_list
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Expression parser for Level 2 (supports all 20 feature names)
 # ---------------------------------------------------------------------------
-
+ 
 def build_level2_parser() -> ExpressionParser:
     """Build an expression parser that recognizes Level 2 feature names."""
     return ExpressionParser(
@@ -74,8 +74,8 @@ def build_level2_parser() -> ExpressionParser:
             "Delta": [Sub],
         },
     )
-
-
+ 
+ 
 def build_level2_chat_client(
     log_dir: str,
     use_level2_features: bool = True,
@@ -85,7 +85,7 @@ def build_level2_chat_client(
 ) -> ChatClient:
     """Create an OpenAI-compatible chat client with Level 2 system prompt."""
     from openai import OpenAI
-
+ 
     logger = get_logger("llm", os.path.join(log_dir, "llm.log"))
     system_prompt = get_level2_system_prompt(use_level2_features)
     return OpenAIClient(
@@ -93,19 +93,19 @@ def build_level2_chat_client(
         config=ChatConfig(system_prompt=system_prompt, logger=logger),
         model=model,
     )
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Callback with convergence logging + optional LLM assist
 # ---------------------------------------------------------------------------
-
+ 
 class Level2LLMCallback(BaseCallback):
     """
     Training callback with:
     - Convergence curve recording (CSV + auto-plot)
     - Optional periodic LLM-assisted alpha replacement
     """
-
+ 
     def __init__(
         self,
         save_path: str,
@@ -122,35 +122,35 @@ class Level2LLMCallback(BaseCallback):
         self.test_calculators = test_calculators
         self.conv_logger = convergence_logger
         os.makedirs(self.save_path, exist_ok=True)
-
+ 
         # LLM assist state
         self.chat_session = chat_session
         self.llm_every_n_steps = llm_every_n_steps
         self._drop_rl_n = drop_rl_n
         self.llm_use_count = 0
         self.last_llm_use = 0
-
+ 
         # Plot every N rollout ends
         self._plot_interval = plot_interval
         self._rollout_count = 0
-
+ 
     def _on_step(self) -> bool:
         return True
-
+ 
     def _on_rollout_end(self) -> None:
         self._rollout_count += 1
-
+ 
         # --- LLM assist ---
         if self.chat_session is not None:
             self._try_use_llm()
-
+ 
         # --- Record metrics ---
         pool = self.pool
         sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
-
+ 
         # Compute train ensemble IC
         train_ic = pool.best_ic_ret
-
+ 
         # Compute test ICs
         test_results = []
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
@@ -162,7 +162,7 @@ class Level2LLMCallback(BaseCallback):
             ric_mean += rank_ic_test * test_calc.data.n_days / n_days
             self.logger.record(f"test/ic_{i}", ic_test)
             self.logger.record(f"test/rank_ic_{i}", rank_ic_test)
-
+ 
         # SB3 logger
         self.logger.record("pool/size", pool.size)
         self.logger.record("pool/significant", sig_count)
@@ -170,7 +170,7 @@ class Level2LLMCallback(BaseCallback):
         self.logger.record("pool/eval_cnt", pool.eval_cnt)
         self.logger.record("test/ic_mean", ic_mean)
         self.logger.record("test/rank_ic_mean", ric_mean)
-
+ 
         # Convergence logger
         self.conv_logger.record_step(
             timestep=self.num_timesteps,
@@ -181,11 +181,11 @@ class Level2LLMCallback(BaseCallback):
             train_ic=train_ic,
             test_results=test_results,
         )
-
+ 
         # Save checkpoint + CSV
         self.save_checkpoint()
         self.conv_logger.save_csv()
-
+ 
         # Auto-plot periodically
         if self._rollout_count % self._plot_interval == 0:
             try:
@@ -196,7 +196,7 @@ class Level2LLMCallback(BaseCallback):
             except Exception as e:
                 if self.verbose > 0:
                     print(f"[Convergence] Plot failed: {e}")
-
+ 
     def save_checkpoint(self):
         path = os.path.join(self.save_path, f"{self.num_timesteps}_steps")
         self.model.save(path)
@@ -204,14 +204,14 @@ class Level2LLMCallback(BaseCallback):
             print(f"Saving model checkpoint to {path}")
         with open(f"{path}_pool.json", "w") as f:
             json.dump(self.pool.to_json_dict(), f)
-
+ 
     def _try_use_llm(self) -> None:
         n_steps = self.num_timesteps
         if n_steps - self.last_llm_use < self.llm_every_n_steps:
             return
         self.last_llm_use = n_steps
         self.llm_use_count += 1
-
+ 
         assert self.chat_session is not None
         self.chat_session.client.reset()
         logger = self.chat_session.logger
@@ -219,7 +219,7 @@ class Level2LLMCallback(BaseCallback):
             f"[Step: {n_steps}] Trying LLM (#{self.llm_use_count}): "
             f"IC={self.pool.best_ic_ret:.4f}"
         )
-
+ 
         try:
             remain_n = max(0, self.pool.size - self._drop_rl_n)
             remain = self.pool.most_significant_indices(remain_n)
@@ -227,21 +227,21 @@ class Level2LLMCallback(BaseCallback):
             self.chat_session.update_pool(self.pool)
         except Exception as e:
             logger.warning(f"LLM invocation failed: {type(e).__name__}: {e}")
-
+ 
     @property
     def pool(self) -> LinearAlphaPool:
         assert isinstance(self.env_core.pool, LinearAlphaPool)
         return self.env_core.pool
-
+ 
     @property
     def env_core(self) -> AlphaEnvCore:
         return self.training_env.envs[0].unwrapped
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
-
+ 
 def run_single_experiment(
     seed: int = 0,
     instruments: Union[str, List[str]] = "auto",
@@ -250,12 +250,12 @@ def run_single_experiment(
     data_root: str = "~/EquityLevel2/stock",
     use_level2_features: bool = False,
     # Data split
-    train_start: str = "2022-01-05",
-    train_end: str = "2022-09-30",
-    valid_start: str = "2022-10-01",
-    valid_end: str = "2022-11-30",
-    test_start: str = "2022-12-01",
-    test_end: str = "2022-12-31",
+    train_start: str = "2023-03-01",
+    train_end: str = "2023-06-30",
+    valid_start: str = "2023-7-01",
+    valid_end: str = "2023-7-31",
+    test_start: str = "2023-8-01",
+    test_end: str = "2023-8-31",
     # Bar config
     max_backtrack_bars: int = 80,
     max_future_bars: int = 80,
@@ -276,7 +276,7 @@ def run_single_experiment(
 ):
     """
     Train alpha factors with optional LLM assistance.
-
+ 
     Modes:
       - Pure RL (default): no LLM flags
       - LLM warm start only: --llm_warmstart
@@ -287,7 +287,7 @@ def run_single_experiment(
     reseed_everything(seed)
     features = LEVEL2_FEATURES if use_level2_features else BASIC_FEATURES
     feature_mode = "level2" if use_level2_features else "basic"
-
+ 
     # Determine tag
     if use_llm:
         tag = f"llm_d{drop_rl_n}"
@@ -295,7 +295,7 @@ def run_single_experiment(
         tag = "llm_warmstart"
     else:
         tag = "rl"
-
+ 
     print(f"""[Level2+LLM] Starting training
     Seed: {seed}
     Data root: {data_root}
@@ -312,23 +312,23 @@ def run_single_experiment(
     Train: [{train_start}, {train_end}]
     Valid: [{valid_start}, {valid_end}]
     Test:  [{test_start}, {test_end}]""")
-
+ 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     name_prefix = f"l2_{feature_mode}_{pool_capacity}_{seed}_{timestamp}_{tag}"
     save_path = os.path.join("./out/results", name_prefix)
     os.makedirs(save_path, exist_ok=True)
-
+ 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+ 
     # Parse instrument list if provided as JSON string
     if isinstance(instruments, str) and instruments.startswith("["):
         instruments = json.loads(instruments)
     if instruments == "auto":
         instruments = "auto"
-
+ 
     close = Feature(Level2FeatureType.CLOSE)
     target = Ref(close, -max_future_bars) / close - 1
-
+ 
     def get_dataset(start: str, end: str) -> Level2StockData:
         return Level2StockData(
             instrument=instruments,
@@ -343,7 +343,7 @@ def run_single_experiment(
             max_workers=max_workers,
             bar_size_min=bar_size_min,
         )
-
+ 
     segments = [
         (train_start, train_end),
         (valid_start, valid_end),
@@ -357,7 +357,7 @@ def run_single_experiment(
             f"{ds.n_days} bars, {ds.n_stocks} stocks, {ds.n_features} features"
         )
     calculators = [Level2Calculator(d, target) for d in datasets]
-
+ 
     # --- Pool factory (needed for LLM interaction) ---
     def build_pool(exprs: Optional[List[Expression]] = None) -> MseAlphaPool:
         pool = MseAlphaPool(
@@ -370,11 +370,11 @@ def run_single_experiment(
         if exprs:
             pool.force_load_exprs(exprs)
         return pool
-
+ 
     # --- LLM setup ---
     chat_session: Optional[InterativeSession] = None
     pool = build_pool()
-
+ 
     if llm_warmstart or use_llm:
         print("[Level2+LLM] Setting up LLM client...")
         chat_client = build_level2_chat_client(
@@ -394,15 +394,15 @@ def run_single_experiment(
             replace_k=llm_replace_n,
             forgetful=True,
         )
-
+ 
         # Warm start: LLM generates initial pool
         print("[Level2+LLM] LLM generating initial alpha pool...")
         pool = inter.run()
         print(f"[Level2+LLM] Initial pool: {pool.size} alphas, IC={pool.best_ic_ret:.4f}")
-
+ 
         if use_llm:
             chat_session = inter  # Keep session for periodic assist
-
+ 
     # --- Environment ---
     env = Level2AlphaEnv(
         pool=pool,
@@ -410,10 +410,10 @@ def run_single_experiment(
         device=device,
         print_expr=True,
     )
-
+ 
     # --- Convergence logger ---
     conv_logger = ConvergenceLogger(save_dir=save_path)
-
+ 
     # --- Callback ---
     callback = Level2LLMCallback(
         save_path=save_path,
@@ -425,7 +425,7 @@ def run_single_experiment(
         drop_rl_n=drop_rl_n,
         plot_interval=plot_interval,
     )
-
+ 
     # --- PPO model ---
     model = MaskablePPO(
         "MlpPolicy",
@@ -446,14 +446,14 @@ def run_single_experiment(
         device=device,
         verbose=1,
     )
-
+ 
     print("[Level2+LLM] Starting RL training...")
     model.learn(
         total_timesteps=steps,
         callback=callback,
         tb_log_name=name_prefix,
     )
-
+ 
     # --- Final convergence output ---
     csv_path = conv_logger.save_csv()
     conv_logger.save_json()
@@ -462,7 +462,7 @@ def run_single_experiment(
         print(f"[Level2+LLM] Convergence plot: {plot_path}")
     except Exception as e:
         print(f"[Level2+LLM] Plot failed: {e}")
-
+ 
     summary = conv_logger.summary()
     print(f"[Level2+LLM] Training complete.")
     print(f"  Total steps: {summary.get('total_steps', 'N/A')}")
@@ -471,8 +471,8 @@ def run_single_experiment(
     print(f"  Best test IC mean: {summary.get('best_test_ic_mean', 'N/A'):.4f} "
           f"(at step {summary.get('best_test_ic_mean_step', 'N/A')})")
     print(f"  Results: {save_path}")
-
-
+ 
+ 
 def main(
     random_seeds: Union[int, Tuple[int]] = 0,
     pool_capacity: int = 20,
@@ -490,12 +490,12 @@ def main(
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
     # Data split
-    train_start: str = "2022-01-05",
-    train_end: str = "2022-09-30",
-    valid_start: str = "2022-10-01",
-    valid_end: str = "2022-11-30",
-    test_start: str = "2022-12-01",
-    test_end: str = "2022-12-31",
+    train_start: str = "2023-03-01",
+    train_end: str = "2023-06-30",
+    valid_start: str = "2023-7-01",
+    valid_end: str = "2023-7-31",
+    test_start: str = "2023-8-01",
+    test_end: str = "2023-8-31",
     max_backtrack_bars: int = 80,
     max_future_bars: int = 80,
     cache_dir: Optional[str] = "./out/l2_cache",
@@ -505,7 +505,7 @@ def main(
 ):
     """
     Train alpha factors using Level 2 HDF5 data with optional LLM assistance.
-
+ 
     :param random_seeds: Random seed(s)
     :param pool_capacity: Maximum alpha pool size
     :param instruments: Stock list (JSON array) or "auto" for auto-discovery
@@ -559,7 +559,7 @@ def main(
             llm_model=llm_model,
             plot_interval=plot_interval,
         )
-
-
+ 
+ 
 if __name__ == "__main__":
     fire.Fire(main)
