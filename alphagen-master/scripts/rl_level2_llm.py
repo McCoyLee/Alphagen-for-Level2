@@ -116,20 +116,22 @@ class Level2LLMCallback(BaseCallback):
         llm_every_n_steps: int = 25_000,
         drop_rl_n: int = 5,
         plot_interval: int = 10,
+        gentle_inject: bool = True,
     ):
         super().__init__(verbose)
         self.save_path = save_path
         self.test_calculators = test_calculators
         self.conv_logger = convergence_logger
         os.makedirs(self.save_path, exist_ok=True)
- 
+
         # LLM assist state
         self.chat_session = chat_session
         self.llm_every_n_steps = llm_every_n_steps
         self._drop_rl_n = drop_rl_n
         self.llm_use_count = 0
         self.last_llm_use = 0
- 
+        self._gentle_inject = gentle_inject
+
         # Plot every N rollout ends
         self._plot_interval = plot_interval
         self._rollout_count = 0
@@ -211,7 +213,7 @@ class Level2LLMCallback(BaseCallback):
             return
         self.last_llm_use = n_steps
         self.llm_use_count += 1
- 
+
         assert self.chat_session is not None
         self.chat_session.client.reset()
         logger = self.chat_session.logger
@@ -219,7 +221,14 @@ class Level2LLMCallback(BaseCallback):
             f"[Step: {n_steps}] Trying LLM (#{self.llm_use_count}): "
             f"IC={self.pool.best_ic_ret:.4f}"
         )
- 
+
+        if self._gentle_inject:
+            self._gentle_llm_inject(logger)
+        else:
+            self._aggressive_llm_inject(logger)
+
+    def _aggressive_llm_inject(self, logger) -> None:
+        """Original behavior: drop worst alphas, let LLM bulk-replace."""
         try:
             remain_n = max(0, self.pool.size - self._drop_rl_n)
             remain = self.pool.most_significant_indices(remain_n)
@@ -227,6 +236,54 @@ class Level2LLMCallback(BaseCallback):
             self.chat_session.update_pool(self.pool)
         except Exception as e:
             logger.warning(f"LLM invocation failed: {type(e).__name__}: {e}")
+
+    def _gentle_llm_inject(self, logger) -> None:
+        """
+        Gentle injection: LLM generates candidates, each goes through
+        the normal try_new_expr path. Pool decides whether to accept.
+        No forced deletion — reward landscape changes gradually.
+        """
+        try:
+            # Generate a textual report of the current pool for LLM context
+            report_str, _ = self.chat_session._generate_report(self.pool)
+            from alphagen_llm.prompts.common import alpha_phrase
+            n_request = self._drop_rl_n
+            prompt = (
+                "Here are the current alphas and their metrics:\n"
+                f"{report_str}\n"
+                f"Please generate {alpha_phrase(n_request, 'new')} that are "
+                "DIFFERENT from and COMPLEMENTARY to the existing ones. "
+                "Focus on capturing different market patterns. "
+                "One alpha per line, no numbering, nothing else."
+            )
+            lines = self.chat_session.client.chat_complete(prompt)
+            exprs, invalid = safe_parse_list(
+                lines.split("\n"), self.chat_session._parser
+            )
+
+            if invalid:
+                logger.debug(f"LLM invalid expressions: {invalid}")
+
+            # Feed each candidate through the normal pool acceptance path
+            accepted = 0
+            for expr in exprs:
+                old_obj = self.pool.best_obj
+                try:
+                    new_obj = self.pool.try_new_expr(expr)
+                    if new_obj > old_obj:
+                        accepted += 1
+                        logger.debug(f"  Accepted: {expr} (obj {old_obj:.4f} -> {new_obj:.4f})")
+                    else:
+                        logger.debug(f"  Rejected: {expr} (no improvement)")
+                except Exception as e:
+                    logger.debug(f"  Failed: {expr} ({e})")
+
+            logger.debug(
+                f"LLM gentle inject: generated {len(exprs)}, "
+                f"accepted {accepted}, pool size {self.pool.size}"
+            )
+        except Exception as e:
+            logger.warning(f"LLM gentle inject failed: {type(e).__name__}: {e}")
  
     @property
     def pool(self) -> LinearAlphaPool:
@@ -271,18 +328,19 @@ def run_single_experiment(
     llm_base_url: str = "http://10.2.1.205:8796/v1",
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
+    gentle_inject: bool = True,
     # Convergence plot
     plot_interval: int = 10,
 ):
     """
     Train alpha factors with optional LLM assistance.
- 
+
     Modes:
       - Pure RL (default): no LLM flags
       - LLM warm start only: --llm_warmstart
         LLM generates initial alpha pool, then pure RL training
       - Full LLM assist: --use_llm
-        Warm start + periodic LLM replacement of worst alphas every N steps
+        Warm start + periodic LLM candidate injection every N steps
     """
     reseed_everything(seed)
     features = LEVEL2_FEATURES if use_level2_features else BASIC_FEATURES
@@ -424,6 +482,7 @@ def run_single_experiment(
         llm_every_n_steps=llm_every_n_steps,
         drop_rl_n=drop_rl_n,
         plot_interval=plot_interval,
+        gentle_inject=gentle_inject,
     )
  
     # --- PPO model ---
@@ -489,6 +548,7 @@ def main(
     llm_base_url: str = "http://10.2.1.205:8796/v1",
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
+    gentle_inject: bool = True,
     # Data split
     train_start: str = "2023-03-01",
     train_end: str = "2023-06-30",
@@ -520,6 +580,7 @@ def main(
     :param llm_base_url: OpenAI-compatible API base URL
     :param llm_api_key: API key
     :param llm_model: Model name
+    :param gentle_inject: Use gentle injection (True) vs aggressive replacement (False)
     :param plot_interval: Save convergence plot every N rollout ends
     """
     if isinstance(random_seeds, int):
@@ -557,6 +618,7 @@ def main(
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
             llm_model=llm_model,
+            gentle_inject=gentle_inject,
             plot_interval=plot_interval,
         )
  
