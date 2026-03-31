@@ -29,7 +29,7 @@ from alphagen.data.calculator import AlphaCalculator
 class DiversityMseAlphaPool(MseAlphaPool):
     """
     MseAlphaPool extended with:
-      1. Configurable ic_mut_threshold (default 0.99 → recommended 0.7)
+      1. Configurable ic_mut_threshold using MAX mutual IC (not per-alpha early exit)
       2. Optional diversity bonus in reward
       3. Periodic pool deduplication
 
@@ -38,6 +38,14 @@ class DiversityMseAlphaPool(MseAlphaPool):
 
     This encourages the RL agent to generate alphas that are dissimilar
     to existing pool members, not just ones that improve train IC.
+
+    IMPORTANT: The parent class _calc_ics() rejects if ANY single mutual IC
+    exceeds the threshold (early exit in the loop). This is too aggressive for
+    thresholds like 0.7 — once the pool has 5+ alphas, nearly every candidate
+    correlates >0.7 with at least one existing alpha and gets rejected.
+
+    This subclass overrides _calc_ics() to compute ALL mutual ICs first,
+    then reject only if the MAXIMUM mutual IC exceeds the threshold.
     """
 
     def __init__(
@@ -54,10 +62,11 @@ class DiversityMseAlphaPool(MseAlphaPool):
         Args:
             capacity, calculator, ic_lower_bound, l1_alpha, device:
                 same as MseAlphaPool
-            ic_mut_threshold: reject new alpha if mutual IC with any
-                existing alpha exceeds this value.
+            ic_mut_threshold: reject new alpha if its MAX mutual IC with
+                existing alphas exceeds this value.
                 - 0.99 = nearly no filtering (original behavior)
-                - 0.7  = recommended, rejects redundant factors
+                - 0.85 = moderate, rejects near-duplicates
+                - 0.7  = strict, may reject too many with large pools
             diversity_bonus: coefficient for diversity reward term.
                 - 0.0 = disabled (original behavior)
                 - 0.05~0.2 = typical range
@@ -71,6 +80,41 @@ class DiversityMseAlphaPool(MseAlphaPool):
         )
         self._ic_mut_threshold = ic_mut_threshold
         self._diversity_bonus = diversity_bonus
+
+    def _calc_ics(
+        self,
+        expr: Expression,
+        ic_mut_threshold: Optional[float] = None,
+    ) -> Tuple[float, Optional[List[float]]]:
+        """
+        Override: compute ALL mutual ICs first, then reject based on MAX.
+
+        The parent's _calc_ics rejects as soon as ANY single mutual IC exceeds
+        the threshold (early exit). This causes the eval_cnt to drop drastically
+        with lower thresholds (e.g. 0.7) because virtually every new expression
+        correlates >0.7 with at least one pool member.
+
+        This version computes all mutual ICs, then checks whether the maximum
+        exceeds the threshold. This is the correct semantic: "reject if the new
+        alpha is essentially a duplicate of an existing one" (high MAX correlation),
+        not "reject if the new alpha has any moderate correlation with any alpha."
+        """
+        single_ic = self.calculator.calc_single_IC_ret(expr)
+        if not self._under_thres_alpha and single_ic < self._ic_lower_bound:
+            return single_ic, None
+
+        mutual_ics = []
+        for i in range(self.size):
+            mutual_ic = self.calculator.calc_mutual_IC(expr, self.exprs[i])
+            mutual_ics.append(mutual_ic)
+
+        # Reject based on MAX mutual IC (not per-alpha early exit)
+        if ic_mut_threshold is not None and len(mutual_ics) > 0:
+            max_mut = max(mutual_ics)
+            if max_mut > ic_mut_threshold:
+                return single_ic, None
+
+        return single_ic, mutual_ics
 
     def try_new_expr(self, expr: Expression) -> float:
         """
