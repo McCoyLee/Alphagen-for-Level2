@@ -76,6 +76,8 @@ class ConvergenceLogger:
         pool_eval_cnt: int,
         train_ic: float = 0.0,
         train_rank_ic: float = 0.0,
+        valid_ic: Optional[float] = None,
+        valid_rank_ic: Optional[float] = None,
         test_results: Optional[List[Tuple[float, float]]] = None,
     ) -> StepRecord:
         """
@@ -89,6 +91,8 @@ class ConvergenceLogger:
             pool_eval_cnt: total number of expressions evaluated
             train_ic: ensemble IC on training set
             train_rank_ic: ensemble Rank IC on training set
+            valid_ic: optional explicit validation IC
+            valid_rank_ic: optional explicit validation Rank IC
             test_results: list of (ic, rank_ic) tuples per test calculator
                           Convention: [valid, test] or [test1, test2, ...]
  
@@ -105,12 +109,20 @@ class ConvergenceLogger:
         else:
             ic_mean, ric_mean = 0.0, 0.0
  
-        # Separate valid vs test if convention is [valid, test, ...]
-        valid_ic = test_results[0][0] if len(test_results) > 0 else 0.0
-        valid_ric = test_results[0][1] if len(test_results) > 0 else 0.0
-        test_ic = test_results[1][0] if len(test_results) > 1 else 0.0
-        test_ric = test_results[1][1] if len(test_results) > 1 else 0.0
- 
+        # Valid/Test separation
+        # 1) Prefer explicit validation inputs when provided.
+        # 2) Backward compatible fallback: treat first test_results item as valid.
+        if valid_ic is not None:
+            valid_ic_val = float(valid_ic)
+            valid_ric_val = float(valid_rank_ic) if valid_rank_ic is not None else 0.0
+            test_ic = test_results[0][0] if len(test_results) > 0 else 0.0
+            test_ric = test_results[0][1] if len(test_results) > 0 else 0.0
+        else:
+            valid_ic_val = test_results[0][0] if len(test_results) > 0 else 0.0
+            valid_ric_val = test_results[0][1] if len(test_results) > 0 else 0.0
+            test_ic = test_results[1][0] if len(test_results) > 1 else 0.0
+            test_ric = test_results[1][1] if len(test_results) > 1 else 0.0
+
         rec = StepRecord(
             timestep=timestep,
             pool_size=pool_size,
@@ -119,8 +131,8 @@ class ConvergenceLogger:
             pool_eval_cnt=pool_eval_cnt,
             train_ic=train_ic,
             train_rank_ic=train_rank_ic,
-            valid_ic=valid_ic,
-            valid_rank_ic=valid_ric,
+            valid_ic=valid_ic_val,
+            valid_rank_ic=valid_ric_val,
             test_ic=test_ic,
             test_rank_ic=test_ric,
             test_ic_mean=float(ic_mean),
@@ -207,6 +219,7 @@ def plot_convergence(
     test_ic_mean, test_ric_mean = [], []
     valid_ric, test_ric = [], []
  
+    test_details_len = []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -221,6 +234,13 @@ def plot_convergence(
             test_ric_mean.append(float(row["test_rank_ic_mean"]))
             valid_ric.append(float(row["valid_rank_ic"]))
             test_ric.append(float(row["test_rank_ic"]))
+            try:
+                details = json.loads(row.get("test_details", "[]"))
+                test_details_len.append(len(details))
+            except Exception:
+                test_details_len.append(0)
+
+    has_multi_test_sets = any(n > 1 for n in test_details_len)
  
     fig, axes = plt.subplots(2, 2, figsize=figsize)
     fig.suptitle("RL Training Convergence", fontsize=14, fontweight="bold")
@@ -238,7 +258,8 @@ def plot_convergence(
     ax = axes[0, 1]
     ax.plot(steps, valid_ic, "g-", linewidth=1.2, label="Valid IC")
     ax.plot(steps, test_ic, "r-", linewidth=1.2, label="Test IC")
-    ax.plot(steps, test_ic_mean, "m--", linewidth=1.0, label="Test IC Mean")
+    if has_multi_test_sets:
+        ax.plot(steps, test_ic_mean, "m--", linewidth=1.0, label="Test IC Mean")
     ax2 = ax.twinx()
     ax2.plot(steps, valid_ric, "g:", linewidth=0.8, alpha=0.5, label="Valid RankIC")
     ax2.plot(steps, test_ric, "r:", linewidth=0.8, alpha=0.5, label="Test RankIC")
