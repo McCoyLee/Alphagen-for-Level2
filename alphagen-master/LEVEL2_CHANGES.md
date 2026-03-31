@@ -266,3 +266,87 @@ pip install h5py
 
 
 原有依赖不变。**Level 2 训练不再需要 qlib 和 baostock。**
+
+---
+## 八、RL+LLM 辅助训练 (`rl_level2_llm.py`)
+ 
+### 8.1 训练模式
+ 
+| 模式 | 启动参数 | 说明 |
+|------|---------|------|
+| 纯 RL | （默认） | 与 `rl_level2.py` 相同，附带收敛曲线记录 |
+| LLM 暖启动 | `--llm_warmstart` | LLM 生成初始 pool，然后纯 RL 训练 |
+| LLM 定期辅助 | `--use_llm` | 暖启动 + 每 N 步 LLM 注入候选 alpha |
+ 
+### 8.2 LLM 注入方式
+ 
+| 方式 | 参数 | 行为 | 适用场景 |
+|------|------|------|---------|
+| 温和注入（默认） | `--gentle_inject` | LLM 生成候选，走 `try_new_expr` 正常路径，pool 自主决定是否接受 | 推荐，稳定 |
+| 激进注入 | `--gentle_inject=False` | 先删除最差 N 个 alpha，LLM 做 20 轮 `bulk_edit` 替换 | 不推荐，见下方 Bug 分析 |
+ 
+### 8.3 多环境并行
+ 
+```bash
+python scripts/rl_level2_llm.py --n_envs=4 --data_root=...
+```
+ 
+- 使用 SB3 `DummyVecEnv`（同进程，单线程安全）
+- 所有 env 共享同一个 pool 对象
+- PPO 参数自动缩放：`batch_size = 128 * n_envs`, `n_steps = max(2048 // n_envs, 256)`
+ 
+### 8.4 多样性 Alpha 池
+ 
+```bash
+python scripts/rl_level2_llm.py --ic_mut_threshold=0.85 --diversity_bonus=0.1
+```
+ 
+- 使用 `DiversityMseAlphaPool` 替代 `MseAlphaPool`
+- `ic_mut_threshold`: 新 alpha 与现有 alpha 的 **最大** mutual IC 超过阈值则拒绝
+- `diversity_bonus`: 奖励中附加多样性项 `bonus * (1 - avg_abs_mutual_ic)`
+ 
+### 8.5 验证集过拟合控制
+ 
+- Callback 跟踪验证集 IC（第一个 test calculator）
+- 记录最佳验证 IC 时的 pool 快照
+- 连续 `valid_patience`（默认 20）个 rollout 验证 IC 未改善时，回滚到最佳快照
+- `valid_patience=0` 关闭此功能
+ 
+
+## 十、收敛曲线日志 (`convergence_logger.py`)
+ 
+### 输出文件
+| 文件 | 内容 |
+|------|------|
+| `convergence.csv` | 每个 rollout 的指标：timestep, pool_size, train_ic, test_ic, eval_cnt |
+| `convergence.json` | 完整运行摘要，含最佳 IC 及对应步数 |
+| `convergence.png` | 2×2 图：train IC, test IC, pool size, eval_cnt |
+ 
+### 可视化
+```python
+from alphagen_level2.convergence_logger import plot_convergence, compare_runs
+# 单次运行
+plot_convergence("out/results/xxx/convergence.csv")
+# 多次运行对比
+compare_runs(["run1/convergence.csv", "run2/convergence.csv"])
+```
+ 
+---
+## 十一、可训练 Action Prior (`action_prior.py`)
+ 
+### 架构
+Transformer encoder + 分类头，输入已生成的 token 前缀，输出下一个 action 的概率分布。
+ 
+### 训练数据
+从历史成功 alpha 的表达式树中提取 (prefix → next_action) 监督学习对，以 IC 加权采样。
+ 
+### 使用
+```bash
+# 训练 prior 模型
+python scripts/train_action_prior.py --data_dirs="out/results/run1,out/results/run2"
+ 
+# 用 prior 引导 RL
+python scripts/rl_level2_guided.py --prior_path=out/prior/model.pt --beta=0.1
+```
+ 
+`beta` 控制 prior 引导强度：`shaped_reward = reward + beta * log(prior_prob[action])`
