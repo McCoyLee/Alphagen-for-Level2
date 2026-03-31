@@ -43,7 +43,7 @@ from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
- 
+
 from alphagen_level2.stock_data import Level2StockData, Level2FeatureType
 from alphagen_level2.calculator import Level2Calculator
 from alphagen_level2.env_wrapper import Level2AlphaEnv
@@ -52,6 +52,7 @@ from alphagen_level2.config import (
 )
 from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergence
 from alphagen_level2.llm_prompts import get_level2_system_prompt
+from alphagen_level2.diversity_pool import DiversityMseAlphaPool
  
 from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
 from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
@@ -110,8 +111,9 @@ class Level2LLMCallback(BaseCallback):
     Training callback with:
     - Convergence curve recording (CSV + auto-plot)
     - Optional periodic LLM-assisted alpha replacement
+    - Validation-based overfitting detection with pool snapshot rollback
     """
- 
+
     def __init__(
         self,
         save_path: str,
@@ -122,23 +124,35 @@ class Level2LLMCallback(BaseCallback):
         llm_every_n_steps: int = 25_000,
         drop_rl_n: int = 5,
         plot_interval: int = 10,
+        gentle_inject: bool = True,
+        valid_patience: int = 20,
     ):
         super().__init__(verbose)
         self.save_path = save_path
         self.test_calculators = test_calculators
         self.conv_logger = convergence_logger
         os.makedirs(self.save_path, exist_ok=True)
- 
+
         # LLM assist state
         self.chat_session = chat_session
         self.llm_every_n_steps = llm_every_n_steps
         self._drop_rl_n = drop_rl_n
         self.llm_use_count = 0
         self.last_llm_use = 0
- 
+        self._gentle_inject = gentle_inject
+
         # Plot every N rollout ends
         self._plot_interval = plot_interval
         self._rollout_count = 0
+
+        # Validation-based overfitting control:
+        # Track best validation IC and save pool snapshot.
+        # If valid IC degrades for `valid_patience` consecutive rollouts,
+        # restore the best pool snapshot to prevent overfitting.
+        self._valid_patience = valid_patience
+        self._best_valid_ic: float = -999.0
+        self._best_valid_snapshot: Optional[dict] = None
+        self._valid_no_improve_count: int = 0
  
     def _on_step(self) -> bool:
         return True
@@ -169,6 +183,29 @@ class Level2LLMCallback(BaseCallback):
             self.logger.record(f"test/ic_{i}", ic_test)
             self.logger.record(f"test/rank_ic_{i}", rank_ic_test)
  
+        # --- Validation-based overfitting control ---
+        # Use first test calculator as validation set
+        valid_ic = test_results[0][0] if test_results else 0.0
+        if valid_ic > self._best_valid_ic:
+            self._best_valid_ic = valid_ic
+            self._valid_no_improve_count = 0
+            # Snapshot the pool state (expressions + weights)
+            self._best_valid_snapshot = pool.to_json_dict()
+        else:
+            self._valid_no_improve_count += 1
+
+        # If validation IC has not improved for `valid_patience` rollouts,
+        # restore the best pool snapshot to prevent further overfitting
+        if (self._valid_patience > 0
+                and self._valid_no_improve_count >= self._valid_patience
+                and self._best_valid_snapshot is not None
+                and pool.size > 1):
+            self._restore_pool_snapshot()
+            self._valid_no_improve_count = 0
+            if self.verbose > 0:
+                print(f"[Overfit] Valid IC stale for {self._valid_patience} rollouts, "
+                      f"restored best snapshot (valid IC={self._best_valid_ic:.4f})")
+
         # SB3 logger
         self.logger.record("pool/size", pool.size)
         self.logger.record("pool/significant", sig_count)
@@ -176,7 +213,9 @@ class Level2LLMCallback(BaseCallback):
         self.logger.record("pool/eval_cnt", pool.eval_cnt)
         self.logger.record("test/ic_mean", ic_mean)
         self.logger.record("test/rank_ic_mean", ric_mean)
- 
+        self.logger.record("valid/best_ic", self._best_valid_ic)
+        self.logger.record("valid/no_improve_count", self._valid_no_improve_count)
+
         # Convergence logger
         self.conv_logger.record_step(
             timestep=self.num_timesteps,
@@ -187,7 +226,7 @@ class Level2LLMCallback(BaseCallback):
             train_ic=train_ic,
             test_results=test_results,
         )
- 
+
         # Save checkpoint + CSV
         self.save_checkpoint()
         self.conv_logger.save_csv()
@@ -210,14 +249,36 @@ class Level2LLMCallback(BaseCallback):
             print(f"Saving model checkpoint to {path}")
         with open(f"{path}_pool.json", "w") as f:
             json.dump(self.pool.to_json_dict(), f)
- 
+
+    def _restore_pool_snapshot(self) -> None:
+        """Restore pool from the best validation snapshot."""
+        if self._best_valid_snapshot is None:
+            return
+        pool = self.pool
+        parser = build_level2_parser()
+        snapshot = self._best_valid_snapshot
+        # Parse saved expressions
+        exprs = []
+        for expr_str in snapshot.get("exprs", []):
+            try:
+                expr = parser.parse(expr_str)
+                exprs.append(expr)
+            except Exception:
+                continue
+        if not exprs:
+            return
+        weights = snapshot.get("weights", None)
+        # Clear pool and reload
+        pool.leave_only([])
+        pool.force_load_exprs(exprs, weights=weights)
+
     def _try_use_llm(self) -> None:
         n_steps = self.num_timesteps
         if n_steps - self.last_llm_use < self.llm_every_n_steps:
             return
         self.last_llm_use = n_steps
         self.llm_use_count += 1
- 
+
         assert self.chat_session is not None
         self.chat_session.client.reset()
         logger = self.chat_session.logger
@@ -225,7 +286,14 @@ class Level2LLMCallback(BaseCallback):
             f"[Step: {n_steps}] Trying LLM (#{self.llm_use_count}): "
             f"IC={self.pool.best_ic_ret:.4f}"
         )
- 
+
+        if self._gentle_inject:
+            self._gentle_llm_inject(logger)
+        else:
+            self._aggressive_llm_inject(logger)
+
+    def _aggressive_llm_inject(self, logger) -> None:
+        """Original behavior: drop worst alphas, let LLM bulk-replace."""
         try:
             remain_n = max(0, self.pool.size - self._drop_rl_n)
             remain = self.pool.most_significant_indices(remain_n)
@@ -233,6 +301,54 @@ class Level2LLMCallback(BaseCallback):
             self.chat_session.update_pool(self.pool)
         except Exception as e:
             logger.warning(f"LLM invocation failed: {type(e).__name__}: {e}")
+
+    def _gentle_llm_inject(self, logger) -> None:
+        """
+        Gentle injection: LLM generates candidates, each goes through
+        the normal try_new_expr path. Pool decides whether to accept.
+        No forced deletion — reward landscape changes gradually.
+        """
+        try:
+            # Generate a textual report of the current pool for LLM context
+            report_str, _ = self.chat_session._generate_report(self.pool)
+            from alphagen_llm.prompts.common import alpha_phrase
+            n_request = self._drop_rl_n
+            prompt = (
+                "Here are the current alphas and their metrics:\n"
+                f"{report_str}\n"
+                f"Please generate {alpha_phrase(n_request, 'new')} that are "
+                "DIFFERENT from and COMPLEMENTARY to the existing ones. "
+                "Focus on capturing different market patterns. "
+                "One alpha per line, no numbering, nothing else."
+            )
+            lines = self.chat_session.client.chat_complete(prompt)
+            exprs, invalid = safe_parse_list(
+                lines.split("\n"), self.chat_session._parser
+            )
+
+            if invalid:
+                logger.debug(f"LLM invalid expressions: {invalid}")
+
+            # Feed each candidate through the normal pool acceptance path
+            accepted = 0
+            for expr in exprs:
+                old_obj = self.pool.best_obj
+                try:
+                    new_obj = self.pool.try_new_expr(expr)
+                    if new_obj > old_obj:
+                        accepted += 1
+                        logger.debug(f"  Accepted: {expr} (obj {old_obj:.4f} -> {new_obj:.4f})")
+                    else:
+                        logger.debug(f"  Rejected: {expr} (no improvement)")
+                except Exception as e:
+                    logger.debug(f"  Failed: {expr} ({e})")
+
+            logger.debug(
+                f"LLM gentle inject: generated {len(exprs)}, "
+                f"accepted {accepted}, pool size {self.pool.size}"
+            )
+        except Exception as e:
+            logger.warning(f"LLM gentle inject failed: {type(e).__name__}: {e}")
  
     @property
     def pool(self) -> LinearAlphaPool:
@@ -241,7 +357,11 @@ class Level2LLMCallback(BaseCallback):
  
     @property
     def env_core(self) -> AlphaEnvCore:
-        return self.training_env.envs[0].unwrapped
+        env = self.training_env.envs[0]
+        # Navigate through any wrapper chain to reach AlphaEnvCore
+        while hasattr(env, 'env'):
+            env = env.env
+        return env
  
  
 # ---------------------------------------------------------------------------
@@ -277,18 +397,24 @@ def run_single_experiment(
     llm_base_url: str = "http://10.2.1.205:8796/v1",
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
+    gentle_inject: bool = True,
+    # Multi-env parallelism
+    n_envs: int = 1,
+    # Diversity options
+    ic_mut_threshold: float = 0.99,
+    diversity_bonus: float = 0.0,
     # Convergence plot
     plot_interval: int = 10,
 ):
     """
     Train alpha factors with optional LLM assistance.
- 
+
     Modes:
       - Pure RL (default): no LLM flags
       - LLM warm start only: --llm_warmstart
         LLM generates initial alpha pool, then pure RL training
       - Full LLM assist: --use_llm
-        Warm start + periodic LLM replacement of worst alphas every N steps
+        Warm start + periodic LLM candidate injection every N steps
     """
     reseed_everything(seed)
     features = LEVEL2_FEATURES if use_level2_features else BASIC_FEATURES
@@ -310,6 +436,9 @@ def run_single_experiment(
     Pool capacity: {pool_capacity}
     Steps: {steps}
     Mode: {tag}
+    N envs: {n_envs}
+    IC mut threshold: {ic_mut_threshold}
+    Diversity bonus: {diversity_bonus}
     LLM warm start: {llm_warmstart or use_llm}
     LLM periodic assist: {use_llm}
     LLM invoke every: {llm_every_n_steps} steps
@@ -365,17 +494,31 @@ def run_single_experiment(
     calculators = [Level2Calculator(d, target) for d in datasets]
  
     # --- Pool factory (needed for LLM interaction) ---
+    use_diversity = diversity_bonus > 0 or ic_mut_threshold < 0.99
     def build_pool(exprs: Optional[List[Expression]] = None) -> MseAlphaPool:
-        pool = MseAlphaPool(
-            capacity=pool_capacity,
-            calculator=calculators[0],
-            ic_lower_bound=None,
-            l1_alpha=5e-3,
-            device=device,
-        )
+        if use_diversity:
+            pool = DiversityMseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
+                device=device,
+                ic_mut_threshold=ic_mut_threshold,
+                diversity_bonus=diversity_bonus,
+            )
+        else:
+            pool = MseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
+                device=device,
+            )
         if exprs:
             pool.force_load_exprs(exprs)
         return pool
+    if use_diversity:
+        print(f"  Diversity pool: ic_mut_threshold={ic_mut_threshold}, bonus={diversity_bonus}")
  
     # --- LLM setup ---
     chat_session: Optional[InterativeSession] = None
@@ -409,13 +552,28 @@ def run_single_experiment(
         if use_llm:
             chat_session = inter  # Keep session for periodic assist
  
-    # --- Environment ---
-    env = Level2AlphaEnv(
-        pool=pool,
-        use_level2_features=use_level2_features,
-        device=device,
-        print_expr=True,
-    )
+    # --- Environment: single or multi-env parallel ---
+    if n_envs > 1:
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        def make_env(print_expr: bool = False):
+            def _init():
+                return Level2AlphaEnv(
+                    pool=pool,
+                    use_level2_features=use_level2_features,
+                    device=device,
+                    print_expr=print_expr,
+                )
+            return _init
+        env_fns = [make_env(print_expr=True)] + [make_env(print_expr=False)] * (n_envs - 1)
+        env = DummyVecEnv(env_fns)
+        print(f"  Multi-env: {n_envs} parallel environments (DummyVecEnv)")
+    else:
+        env = Level2AlphaEnv(
+            pool=pool,
+            use_level2_features=use_level2_features,
+            device=device,
+            print_expr=True,
+        )
  
     # --- Convergence logger ---
     conv_logger = ConvergenceLogger(save_dir=save_path)
@@ -430,9 +588,12 @@ def run_single_experiment(
         llm_every_n_steps=llm_every_n_steps,
         drop_rl_n=drop_rl_n,
         plot_interval=plot_interval,
+        gentle_inject=gentle_inject,
     )
  
-    # --- PPO model ---
+    # --- PPO model (scale batch_size with n_envs) ---
+    batch_size = 128 * n_envs
+    n_steps = max(2048 // n_envs, 256)
     model = MaskablePPO(
         "MlpPolicy",
         env,
@@ -447,7 +608,8 @@ def run_single_experiment(
         ),
         gamma=1.0,
         ent_coef=0.01,
-        batch_size=256,
+        batch_size=batch_size,
+        n_steps=n_steps,
         tensorboard_log="./out/tensorboard",
         device=device,
         verbose=1,
@@ -495,6 +657,12 @@ def main(
     llm_base_url: str = "http://10.2.1.205:8796/v1",
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
+    gentle_inject: bool = True,
+    # Multi-env parallelism
+    n_envs: int = 1,
+    # Diversity options
+    ic_mut_threshold: float = 0.99,
+    diversity_bonus: float = 0.0,
     # Data split
     train_start: str = "2023-03-01",
     train_end: str = "2023-06-30",
@@ -526,6 +694,10 @@ def main(
     :param llm_base_url: OpenAI-compatible API base URL
     :param llm_api_key: API key
     :param llm_model: Model name
+    :param gentle_inject: Use gentle injection (True) vs aggressive replacement (False)
+    :param n_envs: Number of parallel environments (1=single, 4-8=recommended)
+    :param ic_mut_threshold: Mutual IC threshold to reject correlated alphas (0.7=strict, 0.99=permissive)
+    :param diversity_bonus: Reward bonus for novel alphas (0=off, 0.05-0.2=typical)
     :param plot_interval: Save convergence plot every N rollout ends
     """
     if isinstance(random_seeds, int):
@@ -563,6 +735,10 @@ def main(
             llm_base_url=llm_base_url,
             llm_api_key=llm_api_key,
             llm_model=llm_model,
+            gentle_inject=gentle_inject,
+            n_envs=n_envs,
+            ic_mut_threshold=ic_mut_threshold,
+            diversity_bonus=diversity_bonus,
             plot_interval=plot_interval,
         )
  

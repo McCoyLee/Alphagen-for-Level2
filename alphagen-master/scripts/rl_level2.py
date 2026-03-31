@@ -37,6 +37,7 @@ from alphagen_level2.calculator import Level2Calculator
 from alphagen_level2.env_wrapper import Level2AlphaEnv
 from alphagen_level2.config import BASIC_FEATURES, LEVEL2_FEATURES
 from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergence
+from alphagen_level2.diversity_pool import DiversityMseAlphaPool
 class Level2Callback(BaseCallback):
     def __init__(
         self,
@@ -107,7 +108,11 @@ class Level2Callback(BaseCallback):
         return self.env_core.pool
     @property
     def env_core(self) -> AlphaEnvCore:
-        return self.training_env.envs[0].unwrapped
+        env = self.training_env.envs[0]
+        # Navigate through any wrapper chain to reach AlphaEnvCore
+        while hasattr(env, 'env'):
+            env = env.env
+        return env
 def run_single_experiment(
     seed: int = 0,
     instruments: Union[str, List[str]] = "auto",
@@ -126,6 +131,11 @@ def run_single_experiment(
     cache_dir: Optional[str] = "./out/l2_cache",
     max_workers: int = 4,
     bar_size_min: int = 3,
+    # Multi-env parallelism
+    n_envs: int = 1,
+    # Diversity options
+    ic_mut_threshold: float = 0.99,
+    diversity_bonus: float = 0.0,
 ):
     reseed_everything(seed)
     features = LEVEL2_FEATURES if use_level2_features else BASIC_FEATURES
@@ -181,19 +191,50 @@ def run_single_experiment(
         print(f"  Segment {i}: {seg[0]} ~ {seg[1]}, "
               f"{ds.n_days} bars, {ds.n_stocks} stocks, {ds.n_features} features")
     calculators = [Level2Calculator(d, target) for d in datasets]
-    pool = MseAlphaPool(
-        capacity=pool_capacity,
-        calculator=calculators[0],
-        ic_lower_bound=None,
-        l1_alpha=5e-3,
-        device=device,
-    )
-    env = Level2AlphaEnv(
-        pool=pool,
-        use_level2_features=use_level2_features,
-        device=device,
-        print_expr=True,
-    )
+    # Pool: use DiversityMseAlphaPool when diversity features are requested
+    use_diversity = diversity_bonus > 0 or ic_mut_threshold < 0.99
+    if use_diversity:
+        pool = DiversityMseAlphaPool(
+            capacity=pool_capacity,
+            calculator=calculators[0],
+            ic_lower_bound=None,
+            l1_alpha=5e-3,
+            device=device,
+            ic_mut_threshold=ic_mut_threshold,
+            diversity_bonus=diversity_bonus,
+        )
+        print(f"  Diversity pool: ic_mut_threshold={ic_mut_threshold}, bonus={diversity_bonus}")
+    else:
+        pool = MseAlphaPool(
+            capacity=pool_capacity,
+            calculator=calculators[0],
+            ic_lower_bound=None,
+            l1_alpha=5e-3,
+            device=device,
+        )
+    # Environment: single or multi-env parallel
+    if n_envs > 1:
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        def make_env(print_expr: bool = False):
+            def _init():
+                return Level2AlphaEnv(
+                    pool=pool,
+                    use_level2_features=use_level2_features,
+                    device=device,
+                    print_expr=print_expr,
+                )
+            return _init
+        # Only first env prints expressions to avoid log spam
+        env_fns = [make_env(print_expr=True)] + [make_env(print_expr=False)] * (n_envs - 1)
+        env = DummyVecEnv(env_fns)
+        print(f"  Multi-env: {n_envs} parallel environments (DummyVecEnv)")
+    else:
+        env = Level2AlphaEnv(
+            pool=pool,
+            use_level2_features=use_level2_features,
+            device=device,
+            print_expr=True,
+        )
     conv_logger = ConvergenceLogger(save_dir=save_path)
     callback = Level2Callback(
         save_path=save_path,
@@ -201,6 +242,9 @@ def run_single_experiment(
         verbose=1,
         convergence_logger=conv_logger,
     )
+    # PPO: scale batch_size with n_envs
+    batch_size = 128 * n_envs
+    n_steps = max(2048 // n_envs, 256)
     model = MaskablePPO(
         "MlpPolicy",
         env,
@@ -215,7 +259,8 @@ def run_single_experiment(
         ),
         gamma=1.,
         ent_coef=0.01,
-        batch_size=128,
+        batch_size=batch_size,
+        n_steps=n_steps,
         tensorboard_log="./out/tensorboard",
         device=device,
         verbose=1,
@@ -257,6 +302,9 @@ def main(
     cache_dir: Optional[str] = "./out/l2_cache",
     max_workers: int = 4,
     bar_size_min: int = 3,
+    n_envs: int = 1,
+    ic_mut_threshold: float = 0.99,
+    diversity_bonus: float = 0.0,
 ):
     """
     Train alpha factors using Level 2 local HDF5 data (bar-level).
@@ -271,6 +319,9 @@ def main(
     :param cache_dir: Directory for caching aggregated data (None to disable)
     :param max_workers: Number of threads for parallel HDF5 IO
     :param bar_size_min: Bar size in minutes (default 3)
+    :param n_envs: Number of parallel environments (1=single, 4-8=recommended)
+    :param ic_mut_threshold: Mutual IC threshold to reject correlated alphas (0.7=strict, 0.99=permissive)
+    :param diversity_bonus: Reward bonus for novel alphas (0=off, 0.05-0.2=typical)
     """
     if isinstance(random_seeds, int):
         random_seeds = (random_seeds,)
@@ -295,6 +346,9 @@ def main(
             cache_dir=cache_dir,
             max_workers=max_workers,
             bar_size_min=bar_size_min,
+            n_envs=n_envs,
+            ic_mut_threshold=ic_mut_threshold,
+            diversity_bonus=diversity_bonus,
         )
 if __name__ == '__main__':
     fire.Fire(main)
