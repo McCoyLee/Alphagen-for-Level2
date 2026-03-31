@@ -63,8 +63,8 @@ from alphagen_llm.prompts.common import safe_parse_list
 # ---------------------------------------------------------------------------
  
 def build_level2_parser() -> ExpressionParser:
-    """Build an expression parser that recognizes Level 2 feature names."""
-    return ExpressionParser(
+    """Build an expression parser that recognizes all Level 2 feature names."""
+    parser = ExpressionParser(
         OPERATORS,
         ignore_case=True,
         non_positive_time_deltas_allowed=False,
@@ -74,6 +74,12 @@ def build_level2_parser() -> ExpressionParser:
             "Delta": [Sub],
         },
     )
+    # NOTE:
+    # ExpressionParser defaults to alphagen_qlib.FeatureType (OHLCV+VWAP only).
+    # Here we override the feature dictionary so LLM outputs that use extended
+    # Level 2 names (e.g. $net_order_flow, $txn_vwap) can be parsed correctly.
+    parser._features = {f.name.lower(): f for f in Level2FeatureType}
+    return parser
  
  
 def build_level2_chat_client(
@@ -500,7 +506,7 @@ def run_single_experiment(
         ),
         gamma=1.0,
         ent_coef=0.01,
-        batch_size=128,
+        batch_size=256,
         tensorboard_log="./out/tensorboard",
         device=device,
         verbose=1,
