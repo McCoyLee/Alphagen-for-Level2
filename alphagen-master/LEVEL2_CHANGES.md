@@ -263,6 +263,180 @@ print(f"IC = {calc.calc_single_IC_ret(alpha):.4f}")
 新增：`h5py`
 ```bash
 pip install h5py
-
-
+```
 原有依赖不变。**Level 2 训练不再需要 qlib 和 baostock。**
+
+---
+## 八、RL+LLM 辅助训练 (`rl_level2_llm.py`)
+
+### 8.1 训练模式
+
+| 模式 | 启动参数 | 说明 |
+|------|---------|------|
+| 纯 RL | （默认） | 与 `rl_level2.py` 相同，附带收敛曲线记录 |
+| LLM 暖启动 | `--llm_warmstart` | LLM 生成初始 pool，然后纯 RL 训练 |
+| LLM 定期辅助 | `--use_llm` | 暖启动 + 每 N 步 LLM 注入候选 alpha |
+
+### 8.2 LLM 注入方式
+
+| 方式 | 参数 | 行为 | 适用场景 |
+|------|------|------|---------|
+| 温和注入（默认） | `--gentle_inject` | LLM 生成候选，走 `try_new_expr` 正常路径，pool 自主决定是否接受 | 推荐，稳定 |
+| 激进注入 | `--gentle_inject=False` | 先删除最差 N 个 alpha，LLM 做 20 轮 `bulk_edit` 替换 | 不推荐，见下方 Bug 分析 |
+
+### 8.3 多环境并行
+
+```bash
+python scripts/rl_level2_llm.py --n_envs=4 --data_root=...
+```
+
+- 使用 SB3 `DummyVecEnv`（同进程，单线程安全）
+- 所有 env 共享同一个 pool 对象
+- PPO 参数自动缩放：`batch_size = 128 * n_envs`, `n_steps = max(2048 // n_envs, 256)`
+
+### 8.4 多样性 Alpha 池
+
+```bash
+python scripts/rl_level2_llm.py --ic_mut_threshold=0.85 --diversity_bonus=0.1
+```
+
+- 使用 `DiversityMseAlphaPool` 替代 `MseAlphaPool`
+- `ic_mut_threshold`: 新 alpha 与现有 alpha 的 **最大** mutual IC 超过阈值则拒绝
+- `diversity_bonus`: 奖励中附加多样性项 `bonus * (1 - avg_abs_mutual_ic)`
+
+### 8.5 验证集过拟合控制
+
+- Callback 跟踪验证集 IC（第一个 test calculator）
+- 记录最佳验证 IC 时的 pool 快照
+- 连续 `valid_patience`（默认 20）个 rollout 验证 IC 未改善时，回滚到最佳快照
+- `valid_patience=0` 关闭此功能
+
+---
+## 九、已知 Bug 分析与修复记录
+
+### Bug 1: 激进 LLM 注入导致 training IC 断崖式下跌
+
+**影响版本**：main 分支 `rl_level2_llm.py`（`--use_llm` 模式）
+
+**根因**：`_try_use_llm()` 调用流程：
+```
+leave_only(remain)  → pool 从 10→5 个 alpha（直接删除）
+update_pool(pool, n_updates=20)  → 20 轮 LLM 交互
+  └→ _update() → bulk_edit([], exprs) → try_new_expr × N
+```
+
+问题链：
+1. `leave_only` 直接删除 `drop_rl_n` 个 alpha，ensemble IC 立即下降
+2. `update_pool` 执行 20 轮 LLM 生成 + `bulk_edit`，每轮都可能替换已有 alpha
+3. LLM 生成的表达式质量不可控，20 轮反复搅动导致 pool 质量持续恶化
+4. 每轮 `bulk_edit` 内部对每个表达式调用 `optimize()`（最多 10000 步 Adam），计算开销巨大
+
+**表现**：每次 LLM 介入（每 25000 步），training IC 出现断崖式下跌。
+
+**修复**：feature 分支新增"温和注入"（`gentle_inject=True`，默认开启）：
+- LLM 生成候选后，每个走正常 `try_new_expr` 路径
+- 不调用 `leave_only`，不删除已有 alpha
+- pool 自主决定是否接受（只在改善 ensemble objective 时才接受）
+
+### Bug 2: `_failure_cache` 膨胀导致 eval_cnt 增长放缓
+
+**影响版本**：所有版本的 `LinearAlphaPool`
+
+**根因**：
+```python
+# try_new_expr 内部
+if str(expr) in self._failure_cache:
+    return self.best_obj   # ← 直接返回，不递增 eval_cnt
+
+# pool 满且新 alpha 是最差的时
+self._failure_cache.add(str(expr))  # ← 只增不减
+```
+
+- `_failure_cache` 在正常 RL 训练中只增不减（仅在 `leave_only`/`bulk_edit`/`force_load` 时清空）
+- 随着训练进行，RL policy 生成的表达式模式趋于固定，命中缓存概率逐渐增大
+- 命中缓存的表达式不计入 `eval_cnt`，导致 eval_cnt 增速逐渐放缓
+
+**表现**：eval_cnt 增长曲线从线性变为亚线性。如果 LLM 介入时 `leave_only` 清空了缓存，eval_cnt 会短暂回升，然后再次放缓。
+
+**注意**：这是渐进式的，不是断崖式。断崖式下降见 Bug 3。
+
+### Bug 3: `DiversityMseAlphaPool` 的 `_calc_ics` 逐一拒绝导致 eval_cnt 断崖下降 10x
+
+**影响版本**：feature 分支早期实现（已修复）
+
+**根因**：父类 `_calc_ics()` 在循环中逐一检查 mutual IC：
+```python
+for i in range(self.size):
+    mutual_ic = self.calculator.calc_mutual_IC(expr, self.exprs[i])
+    if ic_mut_threshold is not None and mutual_ic > ic_mut_threshold:
+        return single_ic, None  # ← 只要有 1 个超过阈值就拒绝
+```
+
+当 `ic_mut_threshold=0.7` 且 pool 有 5+ alpha 时，几乎每个新候选都与至少一个现有 alpha 的 mutual IC > 0.7，导致 ~90% 的表达式在 `_calc_ics` 阶段就被拒绝，不进入 `try_new_expr` 的 `eval_cnt += 1`。
+
+eval_cnt 从 ~20000 降到 ~2000（同样步数）。
+
+**修复**：`DiversityMseAlphaPool` 重写 `_calc_ics()`：
+- 先计算**所有**现有 alpha 的 mutual IC
+- 用 **MAX** mutual IC 与阈值比较
+- 语义变为"拒绝近似重复"（最大相关性过高），而非"与任何 alpha 有中等相关性"
+
+### Bug 4: 多环境下 `env_core` 属性使用 `.unwrapped` 无法穿透 wrapper chain
+
+**影响版本**：main 分支 `rl_level2_llm.py`
+
+**根因**：
+```python
+@property
+def env_core(self) -> AlphaEnvCore:
+    return self.training_env.envs[0].unwrapped  # ← SB3 DummyVecEnv 下不一定能到达 AlphaEnvCore
+```
+
+`DummyVecEnv` 包装后，`envs[0]` 是 `Level2EnvWrapper`，其 `.unwrapped` 可能返回自身（gym.Wrapper 的 unwrapped 通常是递归的，但取决于版本）。
+
+**修复**：改为手动遍历 wrapper chain：
+```python
+env = self.training_env.envs[0]
+while hasattr(env, 'env'):
+    env = env.env
+return env
+```
+
+---
+## 十、收敛曲线日志 (`convergence_logger.py`)
+
+### 输出文件
+| 文件 | 内容 |
+|------|------|
+| `convergence.csv` | 每个 rollout 的指标：timestep, pool_size, train_ic, test_ic, eval_cnt |
+| `convergence.json` | 完整运行摘要，含最佳 IC 及对应步数 |
+| `convergence.png` | 2×2 图：train IC, test IC, pool size, eval_cnt |
+
+### 可视化
+```python
+from alphagen_level2.convergence_logger import plot_convergence, compare_runs
+# 单次运行
+plot_convergence("out/results/xxx/convergence.csv")
+# 多次运行对比
+compare_runs(["run1/convergence.csv", "run2/convergence.csv"])
+```
+
+---
+## 十一、可训练 Action Prior (`action_prior.py`)
+
+### 架构
+Transformer encoder + 分类头，输入已生成的 token 前缀，输出下一个 action 的概率分布。
+
+### 训练数据
+从历史成功 alpha 的表达式树中提取 (prefix → next_action) 监督学习对，以 IC 加权采样。
+
+### 使用
+```bash
+# 训练 prior 模型
+python scripts/train_action_prior.py --data_dirs="out/results/run1,out/results/run2"
+
+# 用 prior 引导 RL
+python scripts/rl_level2_guided.py --prior_path=out/prior/model.pt --beta=0.1
+```
+
+`beta` 控制 prior 引导强度：`shaped_reward = reward + beta * log(prior_prob[action])`
