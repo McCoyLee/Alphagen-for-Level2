@@ -30,6 +30,7 @@ import json
 import os
 from typing import Optional, Tuple, List, Union
 from datetime import datetime
+from collections import deque
  
 import numpy as np
 import torch
@@ -117,6 +118,7 @@ class Level2LLMCallback(BaseCallback):
     def __init__(
         self,
         save_path: str,
+        valid_calculator: Level2Calculator,
         test_calculators: List[Level2Calculator],
         convergence_logger: ConvergenceLogger,
         verbose: int = 0,
@@ -126,9 +128,13 @@ class Level2LLMCallback(BaseCallback):
         plot_interval: int = 10,
         gentle_inject: bool = True,
         valid_patience: int = 20,
+        valid_min_delta: float = 1e-4,
+        valid_smooth_window: int = 1,
+        valid_restore_cooldown: int = 3,
     ):
         super().__init__(verbose)
         self.save_path = save_path
+        self.valid_calculator = valid_calculator
         self.test_calculators = test_calculators
         self.conv_logger = convergence_logger
         os.makedirs(self.save_path, exist_ok=True)
@@ -149,10 +155,15 @@ class Level2LLMCallback(BaseCallback):
         # Track best validation IC and save pool snapshot.
         # If valid IC degrades for `valid_patience` consecutive rollouts,
         # restore the best pool snapshot to prevent overfitting.
+        self._valid_min_delta = valid_min_delta
+        self._valid_restore_cooldown = valid_restore_cooldown
+        self._valid_smooth_window = max(1, int(valid_smooth_window))
+        self._valid_hist: deque = deque(maxlen=self._valid_smooth_window)
         self._valid_patience = valid_patience
         self._best_valid_ic: float = -999.0
         self._best_valid_snapshot: Optional[dict] = None
         self._valid_no_improve_count: int = 0
+        self._valid_cooldown_count: int = 0
  
     def _on_step(self) -> bool:
         return True
@@ -171,28 +182,41 @@ class Level2LLMCallback(BaseCallback):
         # Compute train ensemble IC
         train_ic = pool.best_ic_ret
  
-        # Compute test ICs
+        # Compute validation IC (strictly from validation split)
+        valid_ic_raw, valid_rank_ic_raw = pool.test_ensemble(self.valid_calculator)
+        self.logger.record("valid/rank_ic_raw", valid_rank_ic_raw)
+
+        # Compute test ICs (test split only)
         test_results = []
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_mean, ric_mean = 0.0, 0.0
         for i, test_calc in enumerate(self.test_calculators, start=1):
             ic_test, rank_ic_test = pool.test_ensemble(test_calc)
             test_results.append((ic_test, rank_ic_test))
-            ic_mean += ic_test * test_calc.data.n_days / n_days
-            ric_mean += rank_ic_test * test_calc.data.n_days / n_days
+            if n_days > 0:
+                ic_mean += ic_test * test_calc.data.n_days / n_days
+                ric_mean += rank_ic_test * test_calc.data.n_days / n_days
             self.logger.record(f"test/ic_{i}", ic_test)
             self.logger.record(f"test/rank_ic_{i}", rank_ic_test)
  
         # --- Validation-based overfitting control ---
-        # Use first test calculator as validation set
-        valid_ic = test_results[0][0] if test_results else 0.0
-        if valid_ic > self._best_valid_ic:
+        self._valid_hist.append(valid_ic_raw)
+        valid_ic = float(np.mean(self._valid_hist))
+        if valid_ic >= self._best_valid_ic + self._valid_min_delta:
             self._best_valid_ic = valid_ic
             self._valid_no_improve_count = 0
-            # Snapshot the pool state (expressions + weights)
-            self._best_valid_snapshot = pool.to_json_dict()
+            # Snapshot pool + state used by acceptance logic.
+            self._best_valid_snapshot = {
+                "pool": pool.to_json_dict(),
+                "best_obj": float(pool.best_obj),
+                "best_ic_ret": float(pool.best_ic_ret),
+                "eval_cnt": int(pool.eval_cnt),
+            }
         else:
-            self._valid_no_improve_count += 1
+            if self._valid_cooldown_count > 0:
+                self._valid_cooldown_count -= 1
+            else:
+                self._valid_no_improve_count += 1
  
         # If validation IC has not improved for `valid_patience` rollouts,
         # restore the best pool snapshot to prevent further overfitting
@@ -202,6 +226,7 @@ class Level2LLMCallback(BaseCallback):
                 and pool.size > 1):
             self._restore_pool_snapshot()
             self._valid_no_improve_count = 0
+            self._valid_cooldown_count = self._valid_restore_cooldown
             if self.verbose > 0:
                 print(f"[Overfit] Valid IC stale for {self._valid_patience} rollouts, "
                       f"restored best snapshot (valid IC={self._best_valid_ic:.4f})")
@@ -213,8 +238,11 @@ class Level2LLMCallback(BaseCallback):
         self.logger.record("pool/eval_cnt", pool.eval_cnt)
         self.logger.record("test/ic_mean", ic_mean)
         self.logger.record("test/rank_ic_mean", ric_mean)
+        self.logger.record("valid/ic_raw", valid_ic_raw)
+        self.logger.record("valid/ic_smooth", valid_ic)
         self.logger.record("valid/best_ic", self._best_valid_ic)
         self.logger.record("valid/no_improve_count", self._valid_no_improve_count)
+        self.logger.record("valid/cooldown_count", self._valid_cooldown_count)
  
         # Convergence logger
         self.conv_logger.record_step(
@@ -224,6 +252,8 @@ class Level2LLMCallback(BaseCallback):
             pool_best_ic=pool.best_ic_ret,
             pool_eval_cnt=pool.eval_cnt,
             train_ic=train_ic,
+            valid_ic=valid_ic_raw,
+            valid_rank_ic=valid_rank_ic_raw,
             test_results=test_results,
         )
  
@@ -257,9 +287,10 @@ class Level2LLMCallback(BaseCallback):
         pool = self.pool
         parser = build_level2_parser()
         snapshot = self._best_valid_snapshot
+        pool_snapshot = snapshot.get("pool", snapshot)
         # Parse saved expressions
         exprs = []
-        for expr_str in snapshot.get("exprs", []):
+        for expr_str in pool_snapshot.get("exprs", []):
             try:
                 expr = parser.parse(expr_str)
                 exprs.append(expr)
@@ -267,11 +298,17 @@ class Level2LLMCallback(BaseCallback):
                 continue
         if not exprs:
             return
-        weights = snapshot.get("weights", None)
+        weights = pool_snapshot.get("weights", None)
         # Clear pool and reload
         pool.leave_only([])
         pool.force_load_exprs(exprs, weights=weights)
- 
+        if "best_obj" in snapshot:
+            pool.best_obj = float(snapshot["best_obj"])
+        if "best_ic_ret" in snapshot:
+            pool.best_ic_ret = float(snapshot["best_ic_ret"])
+        if "eval_cnt" in snapshot:
+            pool.eval_cnt = int(snapshot["eval_cnt"])
+
     def _try_use_llm(self) -> None:
         n_steps = self.num_timesteps
         if n_steps - self.last_llm_use < self.llm_every_n_steps:
@@ -387,7 +424,8 @@ def run_single_experiment(
     max_future_bars: int = 80,
     cache_dir: Optional[str] = "./out/l2_cache",
     max_workers: int = 4,
-    bar_size_min: int = 3,
+    bar_size_min: float = 3.0,
+    bar_size_sec: Optional[int] = None,
     # LLM options
     llm_warmstart: bool = False,
     use_llm: bool = False,
@@ -405,6 +443,11 @@ def run_single_experiment(
     diversity_bonus: float = 0.0,
     # Convergence plot
     plot_interval: int = 10,
+    # Validation rollback controls
+    valid_patience: int = 20,
+    valid_min_delta: float = 1e-4,
+    valid_smooth_window: int = 1,
+    valid_restore_cooldown: int = 3,
 ):
     """
     Train alpha factors with optional LLM assistance.
@@ -427,12 +470,13 @@ def run_single_experiment(
         tag = "llm_warmstart"
     else:
         tag = "rl"
- 
+    
+    effective_bar_size_min = (float(bar_size_sec) / 60.0) if bar_size_sec is not None else float(bar_size_min)
     print(f"""[Level2+LLM] Starting training
     Seed: {seed}
     Data root: {data_root}
     Feature mode: {feature_mode} ({len(features)} features)
-    Bar size: {bar_size_min} min
+    Bar size: {effective_bar_size_min:.4f} min ({effective_bar_size_min * 60:.1f} sec)
     Pool capacity: {pool_capacity}
     Steps: {steps}
     Mode: {tag}
@@ -477,6 +521,7 @@ def run_single_experiment(
             cache_dir=cache_dir,
             max_workers=max_workers,
             bar_size_min=bar_size_min,
+            bar_size_sec=bar_size_sec,
         )
  
     segments = [
@@ -539,7 +584,9 @@ def run_single_experiment(
             chat_client,
             build_pool,
             calculator_train=calculators[0],
-            calculators_test=calculators[1:],
+            # IMPORTANT: only pass validation split here to avoid test leakage
+            # into LLM prompt-guided pool updates.
+            calculators_test=[calculators[1]],
             replace_k=llm_replace_n,
             forgetful=True,
         )
@@ -581,7 +628,8 @@ def run_single_experiment(
     # --- Callback ---
     callback = Level2LLMCallback(
         save_path=save_path,
-        test_calculators=calculators[1:],
+        valid_calculator=calculators[1],
+        test_calculators=calculators[2:],
         convergence_logger=conv_logger,
         verbose=1,
         chat_session=chat_session,
@@ -589,6 +637,10 @@ def run_single_experiment(
         drop_rl_n=drop_rl_n,
         plot_interval=plot_interval,
         gentle_inject=gentle_inject,
+        valid_patience=valid_patience,
+        valid_min_delta=valid_min_delta,
+        valid_smooth_window=valid_smooth_window,
+        valid_restore_cooldown=valid_restore_cooldown,
     )
  
     # --- PPO model (scale batch_size with n_envs) ---
@@ -674,8 +726,13 @@ def main(
     max_future_bars: int = 80,
     cache_dir: Optional[str] = "./out/l2_cache",
     max_workers: int = 4,
-    bar_size_min: int = 3,
+    bar_size_min: float = 3.0,
+    bar_size_sec: Optional[int] = None,
     plot_interval: int = 10,
+    valid_patience: int = 20,
+    valid_min_delta: float = 1e-4,
+    valid_smooth_window: int = 1,
+    valid_restore_cooldown: int = 3,
 ):
     """
     Train alpha factors using Level 2 HDF5 data with optional LLM assistance.
@@ -698,7 +755,12 @@ def main(
     :param n_envs: Number of parallel environments (1=single, 4-8=recommended)
     :param ic_mut_threshold: Mutual IC threshold to reject correlated alphas (0.7=strict, 0.99=permissive)
     :param diversity_bonus: Reward bonus for novel alphas (0=off, 0.05-0.2=typical)
+    :param bar_size_sec: Bar size in seconds; if set, overrides bar_size_min
     :param plot_interval: Save convergence plot every N rollout ends
+    :param valid_patience: Rollouts without validation improvement before rollback
+    :param valid_min_delta: Minimum increase in validation IC to count as improvement
+    :param valid_smooth_window: Smoothing window size for validation IC in early stopping
+    :param valid_restore_cooldown: Cooldown rollouts after rollback before counting stale steps
     """
     if isinstance(random_seeds, int):
         random_seeds = (random_seeds,)
@@ -727,6 +789,7 @@ def main(
             cache_dir=cache_dir,
             max_workers=max_workers,
             bar_size_min=bar_size_min,
+            bar_size_sec=bar_size_sec,
             llm_warmstart=llm_warmstart,
             use_llm=use_llm,
             llm_every_n_steps=llm_every_n_steps,
@@ -740,6 +803,10 @@ def main(
             ic_mut_threshold=ic_mut_threshold,
             diversity_bonus=diversity_bonus,
             plot_interval=plot_interval,
+            valid_patience=valid_patience,
+            valid_min_delta=valid_min_delta,
+            valid_smooth_window=valid_smooth_window,
+            valid_restore_cooldown=valid_restore_cooldown,
         )
  
  

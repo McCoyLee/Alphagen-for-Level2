@@ -130,7 +130,8 @@ def run_single_experiment(
     max_future_bars: int = 80,
     cache_dir: Optional[str] = "./out/l2_cache",
     max_workers: int = 4,
-    bar_size_min: int = 3,
+    bar_size_min: float = 3.0,
+    bar_size_sec: Optional[int] = None,
     # Multi-env parallelism
     n_envs: int = 1,
     # Diversity options
@@ -140,16 +141,17 @@ def run_single_experiment(
     reseed_everything(seed)
     features = LEVEL2_FEATURES if use_level2_features else BASIC_FEATURES
     feature_mode = "level2" if use_level2_features else "basic"
+    effective_bar_size_min = (float(bar_size_sec) / 60.0) if bar_size_sec is not None else float(bar_size_min)
     print(f"""[Level2] Starting training
     Seed: {seed}
     Data root: {data_root}
     Feature mode: {feature_mode} ({len(features)} features)
-    Bar size: {bar_size_min} min
+    Bar size: {effective_bar_size_min:.4f} min ({effective_bar_size_min * 60:.1f} sec)
     Instruments: {instruments}
     Pool capacity: {pool_capacity}
     Steps: {steps}
-    Max backtrack: {max_backtrack_bars} bars ({max_backtrack_bars * bar_size_min} min)
-    Max future: {max_future_bars} bars ({max_future_bars * bar_size_min} min)
+    Max backtrack: {max_backtrack_bars} bars ({max_backtrack_bars * effective_bar_size_min:.2f} min)
+    Max future: {max_future_bars} bars ({max_future_bars * effective_bar_size_min:.2f} min)
     Train: [{train_start}, {train_end}]
     Valid: [{valid_start}, {valid_end}]
     Test:  [{test_start}, {test_end}]""")
@@ -179,6 +181,7 @@ def run_single_experiment(
             cache_dir=cache_dir,
             max_workers=max_workers,
             bar_size_min=bar_size_min,
+            bar_size_sec=bar_size_sec,
         )
     segments = [
         (train_start, train_end),
@@ -301,7 +304,8 @@ def main(
     max_future_bars: int = 80,
     cache_dir: Optional[str] = "./out/l2_cache",
     max_workers: int = 4,
-    bar_size_min: int = 3,
+    bar_size_min: float = 3.0,
+    bar_size_sec: Optional[int] = None,
     n_envs: int = 1,
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
@@ -319,6 +323,7 @@ def main(
     :param cache_dir: Directory for caching aggregated data (None to disable)
     :param max_workers: Number of threads for parallel HDF5 IO
     :param bar_size_min: Bar size in minutes (default 3)
+    :param bar_size_sec: Bar size in seconds; if set, overrides bar_size_min (e.g. 3 means 3-second bars)
     :param n_envs: Number of parallel environments (1=single, 4-8=recommended)
     :param ic_mut_threshold: Mutual IC threshold to reject correlated alphas (0.7=strict, 0.99=permissive)
     :param diversity_bonus: Reward bonus for novel alphas (0=off, 0.05-0.2=typical)
@@ -345,6 +350,8 @@ def main(
             max_future_bars=max_future_bars,
             cache_dir=cache_dir,
             max_workers=max_workers,
+            bar_size_min=bar_size_min,
+            bar_size_sec=bar_size_sec,
             n_envs=n_envs,
             ic_mut_threshold=ic_mut_threshold,
             diversity_bonus=diversity_bonus,

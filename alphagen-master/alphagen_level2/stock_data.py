@@ -87,7 +87,7 @@ def _parse_tick_time(time_arr: np.ndarray) -> np.ndarray:
     else:
         # Already in minutes or seconds
         return t
-def _compute_bar_edges(bar_size_min: int) -> np.ndarray:
+def _compute_bar_edges(bar_size_min: float) -> np.ndarray:
     """
     Compute bar edge timestamps (in minutes since midnight) for A-share trading hours.
     Morning: 9:30-11:30, Afternoon: 13:00-15:00 → 240 min total.
@@ -111,7 +111,7 @@ def _compute_bar_edges(bar_size_min: int) -> np.ndarray:
 def _resample_tick_to_bars(
     tick_data: dict,
     bar_edges: np.ndarray,
-    bar_size_min: int,
+    bar_size_min: float,
 ) -> np.ndarray:
     """
     Resample tick snapshot data into N-minute bars.
@@ -222,7 +222,7 @@ def _resample_tick_to_bars(
 def _resample_txn_to_bars(
     txn_data: dict,
     bar_edges: np.ndarray,
-    bar_size_min: int,
+    bar_size_min: float,
 ) -> np.ndarray:
     """Resample transaction data into bars. Returns (n_bars, 5) for txn features."""
     n_bars = len(bar_edges)
@@ -287,7 +287,7 @@ def _resample_txn_to_bars(
 def _resample_order_to_bars(
     order_data: dict,
     bar_edges: np.ndarray,
-    bar_size_min: int,
+    bar_size_min: float,
 ) -> np.ndarray:
     """Resample order data into bars. Returns (n_bars, 2) for order features."""
     n_bars = len(bar_edges)
@@ -346,7 +346,8 @@ class Level2StockData:
         data_root: str = "~/EquityLevel2/stock",
         cache_dir: Optional[str] = None,
         max_workers: int = 4,
-        bar_size_min: int = 3,
+        bar_size_min: float = 3.0,
+        bar_size_sec: Optional[int] = None,
         preloaded_data: Optional[Tuple[torch.Tensor, pd.Index, pd.Index]] = None,
     ) -> None:
         self._instrument = instrument
@@ -359,7 +360,9 @@ class Level2StockData:
         self._data_root = data_root
         self._cache_dir = cache_dir
         self._max_workers = max_workers
-        self._bar_size_min = bar_size_min
+        self._bar_size_min = (float(bar_size_sec) / 60.0) if bar_size_sec is not None else float(bar_size_min)
+        if self._bar_size_min <= 0:
+            raise ValueError(f"bar_size_min must be > 0, got {self._bar_size_min}")
         if preloaded_data is not None:
             self.data, self._dates, self._stock_ids = preloaded_data
         else:
@@ -367,7 +370,7 @@ class Level2StockData:
     def _cache_key(self) -> str:
         key_str = (f"{self._instrument}|{self._start_time}|{self._end_time}|"
                    f"{self.max_backtrack_days}|{self.max_future_days}|"
-                   f"{[int(f) for f in self._features]}|bar{self._bar_size_min}")
+                   f"{[int(f) for f in self._features]}|bar{self._bar_size_min:.8f}")
         return hashlib.md5(key_str.encode()).hexdigest()
     def _try_load_cache(self) -> Optional[Tuple[torch.Tensor, pd.Index, pd.Index]]:
         if self._cache_dir is None:

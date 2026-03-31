@@ -76,6 +76,8 @@ class ConvergenceLogger:
         pool_eval_cnt: int,
         train_ic: float = 0.0,
         train_rank_ic: float = 0.0,
+        valid_ic: Optional[float] = None,
+        valid_rank_ic: Optional[float] = None,
         test_results: Optional[List[Tuple[float, float]]] = None,
     ) -> StepRecord:
         """
@@ -89,6 +91,8 @@ class ConvergenceLogger:
             pool_eval_cnt: total number of expressions evaluated
             train_ic: ensemble IC on training set
             train_rank_ic: ensemble Rank IC on training set
+            valid_ic: optional explicit validation IC
+            valid_rank_ic: optional explicit validation Rank IC
             test_results: list of (ic, rank_ic) tuples per test calculator
                           Convention: [valid, test] or [test1, test2, ...]
  
@@ -105,11 +109,19 @@ class ConvergenceLogger:
         else:
             ic_mean, ric_mean = 0.0, 0.0
  
-        # Separate valid vs test if convention is [valid, test, ...]
-        valid_ic = test_results[0][0] if len(test_results) > 0 else 0.0
-        valid_ric = test_results[0][1] if len(test_results) > 0 else 0.0
-        test_ic = test_results[1][0] if len(test_results) > 1 else 0.0
-        test_ric = test_results[1][1] if len(test_results) > 1 else 0.0
+        # Valid/Test separation
+        # 1) Prefer explicit validation inputs when provided.
+        # 2) Backward compatible fallback: treat first test_results item as valid.
+        if valid_ic is not None:
+            valid_ic_val = float(valid_ic)
+            valid_ric_val = float(valid_rank_ic) if valid_rank_ic is not None else 0.0
+            test_ic = test_results[0][0] if len(test_results) > 0 else 0.0
+            test_ric = test_results[0][1] if len(test_results) > 0 else 0.0
+        else:
+            valid_ic_val = test_results[0][0] if len(test_results) > 0 else 0.0
+            valid_ric_val = test_results[0][1] if len(test_results) > 0 else 0.0
+            test_ic = test_results[1][0] if len(test_results) > 1 else 0.0
+            test_ric = test_results[1][1] if len(test_results) > 1 else 0.0
  
         rec = StepRecord(
             timestep=timestep,
@@ -119,8 +131,8 @@ class ConvergenceLogger:
             pool_eval_cnt=pool_eval_cnt,
             train_ic=train_ic,
             train_rank_ic=train_rank_ic,
-            valid_ic=valid_ic,
-            valid_rank_ic=valid_ric,
+            valid_ic=valid_ic_val,
+            valid_rank_ic=valid_ric_val,
             test_ic=test_ic,
             test_rank_ic=test_ric,
             test_ic_mean=float(ic_mean),
