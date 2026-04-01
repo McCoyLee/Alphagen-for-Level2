@@ -258,16 +258,9 @@ target = Ref(close, -80) / close - 1  # 80 bars ≈ 1 天的未来收益
 calc = Level2Calculator(data, target)
 print(f"IC = {calc.calc_single_IC_ret(alpha):.4f}")
 ```
----
-## 七、依赖变更
-新增：`h5py`
-```bash
-pip install h5py
 
 
-原有依赖不变。**Level 2 训练不再需要 qlib 和 baostock。**
 
----
 ## 八、RL+LLM 辅助训练 (`rl_level2_llm.py`)
  
 ### 8.1 训练模式
