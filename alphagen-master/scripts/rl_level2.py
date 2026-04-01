@@ -90,6 +90,7 @@ class Level2Callback(BaseCallback):
                 pool_significant=sig_count,
                 pool_best_ic=pool.best_ic_ret,
                 pool_eval_cnt=pool.eval_cnt,
+                global_eval_cnt=pool.eval_cnt,
                 train_ic=pool.best_ic_ret,
                 valid_ic=valid_ic,
                 valid_rank_ic=valid_rank_ic,
