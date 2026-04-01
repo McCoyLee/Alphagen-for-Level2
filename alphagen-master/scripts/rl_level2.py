@@ -42,6 +42,7 @@ class Level2Callback(BaseCallback):
     def __init__(
         self,
         save_path: str,
+        valid_calculator: Level2Calculator,
         test_calculators: List[Level2Calculator],
         verbose: int = 0,
     convergence_logger: Optional[ConvergenceLogger] = None,
@@ -49,6 +50,7 @@ class Level2Callback(BaseCallback):
     ):
         super().__init__(verbose)
         self.save_path = save_path
+        self.valid_calculator = valid_calculator
         self.test_calculators = test_calculators
         self.conv_logger = convergence_logger
         self._plot_interval = plot_interval
@@ -64,14 +66,18 @@ class Level2Callback(BaseCallback):
         self.logger.record('pool/significant', sig_count)
         self.logger.record('pool/best_ic_ret', pool.best_ic_ret)
         self.logger.record('pool/eval_cnt', pool.eval_cnt)
+        valid_ic, valid_rank_ic = pool.test_ensemble(self.valid_calculator)
+        self.logger.record('valid/ic', valid_ic)
+        self.logger.record('valid/rank_ic', valid_rank_ic)
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
         test_results = []
         for i, test_calc in enumerate(self.test_calculators, start=1):
             ic_test, rank_ic_test = pool.test_ensemble(test_calc)
             test_results.append((ic_test, rank_ic_test))
-            ic_test_mean += ic_test * test_calc.data.n_days / n_days
-            rank_ic_test_mean += rank_ic_test * test_calc.data.n_days / n_days
+            if n_days > 0:
+                ic_test_mean += ic_test * test_calc.data.n_days / n_days
+                rank_ic_test_mean += rank_ic_test * test_calc.data.n_days / n_days
             self.logger.record(f'test/ic_{i}', ic_test)
             self.logger.record(f'test/rank_ic_{i}', rank_ic_test)
         self.logger.record('test/ic_mean', ic_test_mean)
@@ -84,7 +90,10 @@ class Level2Callback(BaseCallback):
                 pool_significant=sig_count,
                 pool_best_ic=pool.best_ic_ret,
                 pool_eval_cnt=pool.eval_cnt,
+                global_eval_cnt=pool.eval_cnt,
                 train_ic=pool.best_ic_ret,
+                valid_ic=valid_ic,
+                valid_rank_ic=valid_rank_ic,
                 test_results=test_results,
             )
             self.conv_logger.save_csv()
@@ -241,7 +250,8 @@ def run_single_experiment(
     conv_logger = ConvergenceLogger(save_dir=save_path)
     callback = Level2Callback(
         save_path=save_path,
-        test_calculators=calculators[1:],
+        valid_calculator=calculators[1],
+        test_calculators=calculators[2:],
         verbose=1,
         convergence_logger=conv_logger,
     )

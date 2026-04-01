@@ -34,6 +34,7 @@ class StepRecord:
     pool_significant: int
     pool_best_ic: float
     pool_eval_cnt: int
+    global_eval_cnt: int = 0
     train_ic: float = 0.0
     train_rank_ic: float = 0.0
     valid_ic: float = 0.0
@@ -57,7 +58,7 @@ class ConvergenceLogger:
  
     COLUMNS = [
         "timestep", "pool_size", "pool_significant", "pool_best_ic",
-        "pool_eval_cnt", "train_ic", "train_rank_ic",
+        "pool_eval_cnt", "global_eval_cnt", "train_ic", "train_rank_ic",
         "valid_ic", "valid_rank_ic", "test_ic", "test_rank_ic",
         "test_ic_mean", "test_rank_ic_mean", "test_details",
     ]
@@ -74,6 +75,7 @@ class ConvergenceLogger:
         pool_significant: int,
         pool_best_ic: float,
         pool_eval_cnt: int,
+        global_eval_cnt: Optional[int] = None,
         train_ic: float = 0.0,
         train_rank_ic: float = 0.0,
         valid_ic: Optional[float] = None,
@@ -91,6 +93,7 @@ class ConvergenceLogger:
             pool_eval_cnt: total number of expressions evaluated
             train_ic: ensemble IC on training set
             train_rank_ic: ensemble Rank IC on training set
+            global_eval_cnt: monotonic evaluated-expression counter
             valid_ic: optional explicit validation IC
             valid_rank_ic: optional explicit validation Rank IC
             test_results: list of (ic, rank_ic) tuples per test calculator
@@ -131,6 +134,7 @@ class ConvergenceLogger:
             pool_eval_cnt=pool_eval_cnt,
             train_ic=train_ic,
             train_rank_ic=train_rank_ic,
+            global_eval_cnt=(pool_eval_cnt if global_eval_cnt is None else int(global_eval_cnt)),
             valid_ic=valid_ic_val,
             valid_rank_ic=valid_ric_val,
             test_ic=test_ic,
@@ -215,10 +219,11 @@ def plot_convergence(
  
     # Read CSV
     steps, pool_best_ic, valid_ic, test_ic = [], [], [], []
-    pool_size, pool_sig, eval_cnt = [], [], []
+    pool_size, pool_sig, eval_cnt, global_eval_cnt = [], [], [], []
     test_ic_mean, test_ric_mean = [], []
     valid_ric, test_ric = [], []
- 
+    
+    test_details_len = []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -229,10 +234,18 @@ def plot_convergence(
             pool_size.append(int(row["pool_size"]))
             pool_sig.append(int(row["pool_significant"]))
             eval_cnt.append(int(row["pool_eval_cnt"]))
+            global_eval_cnt.append(int(row.get("global_eval_cnt", row["pool_eval_cnt"])))
             test_ic_mean.append(float(row["test_ic_mean"]))
             test_ric_mean.append(float(row["test_rank_ic_mean"]))
             valid_ric.append(float(row["valid_rank_ic"]))
             test_ric.append(float(row["test_rank_ic"]))
+            try:
+                details = json.loads(row.get("test_details", "[]"))
+                test_details_len.append(len(details))
+            except Exception:
+                test_details_len.append(0)
+
+    has_multi_test_sets = any(n > 1 for n in test_details_len)
  
     fig, axes = plt.subplots(2, 2, figsize=figsize)
     fig.suptitle("RL Training Convergence", fontsize=14, fontweight="bold")
@@ -250,7 +263,8 @@ def plot_convergence(
     ax = axes[0, 1]
     ax.plot(steps, valid_ic, "g-", linewidth=1.2, label="Valid IC")
     ax.plot(steps, test_ic, "r-", linewidth=1.2, label="Test IC")
-    ax.plot(steps, test_ic_mean, "m--", linewidth=1.0, label="Test IC Mean")
+    if has_multi_test_sets:
+        ax.plot(steps, test_ic_mean, "m--", linewidth=1.0, label="Test IC Mean")
     ax2 = ax.twinx()
     ax2.plot(steps, valid_ric, "g:", linewidth=0.8, alpha=0.5, label="Valid RankIC")
     ax2.plot(steps, test_ric, "r:", linewidth=0.8, alpha=0.5, label="Test RankIC")
@@ -274,10 +288,13 @@ def plot_convergence(
  
     # Bottom-right: Eval Count
     ax = axes[1, 1]
-    ax.plot(steps, eval_cnt, "purple", linewidth=1.2)
+    ax.plot(steps, eval_cnt, "purple", linewidth=1.2, label="Eval Count (pool)")
+    if any(g != e for g, e in zip(global_eval_cnt, eval_cnt)):
+        ax.plot(steps, global_eval_cnt, "k--", linewidth=1.0, label="Global Eval Count")
     ax.set_xlabel("Timestep")
     ax.set_ylabel("Eval Count")
     ax.set_title("Expressions Evaluated")
+    ax.legend()
     ax.grid(True, alpha=0.3)
  
     plt.tight_layout()

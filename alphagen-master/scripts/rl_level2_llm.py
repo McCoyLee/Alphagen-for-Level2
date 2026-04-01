@@ -164,6 +164,7 @@ class Level2LLMCallback(BaseCallback):
         self._best_valid_snapshot: Optional[dict] = None
         self._valid_no_improve_count: int = 0
         self._valid_cooldown_count: int = 0
+        self._global_eval_cnt: int = 0
  
     def _on_step(self) -> bool:
         return True
@@ -177,6 +178,7 @@ class Level2LLMCallback(BaseCallback):
  
         # --- Record metrics ---
         pool = self.pool
+        self._global_eval_cnt = max(self._global_eval_cnt, int(pool.eval_cnt))
         sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
  
         # Compute train ensemble IC
@@ -236,6 +238,7 @@ class Level2LLMCallback(BaseCallback):
         self.logger.record("pool/significant", sig_count)
         self.logger.record("pool/best_ic_ret", pool.best_ic_ret)
         self.logger.record("pool/eval_cnt", pool.eval_cnt)
+        self.logger.record("pool/global_eval_cnt", self._global_eval_cnt)
         self.logger.record("test/ic_mean", ic_mean)
         self.logger.record("test/rank_ic_mean", ric_mean)
         self.logger.record("valid/ic_raw", valid_ic_raw)
@@ -251,6 +254,7 @@ class Level2LLMCallback(BaseCallback):
             pool_significant=sig_count,
             pool_best_ic=pool.best_ic_ret,
             pool_eval_cnt=pool.eval_cnt,
+            global_eval_cnt=self._global_eval_cnt,
             train_ic=train_ic,
             valid_ic=valid_ic_raw,
             valid_rank_ic=valid_rank_ic_raw,
