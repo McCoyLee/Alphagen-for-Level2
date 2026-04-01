@@ -165,6 +165,7 @@ class Level2LLMCallback(BaseCallback):
         self._valid_no_improve_count: int = 0
         self._valid_cooldown_count: int = 0
         self._global_eval_cnt: int = 0
+        self._last_pool_eval_cnt: int = 0
  
     def _on_step(self) -> bool:
         return True
@@ -179,6 +180,11 @@ class Level2LLMCallback(BaseCallback):
         # --- Record metrics ---
         pool = self.pool
         self._global_eval_cnt = max(self._global_eval_cnt, int(pool.eval_cnt))
+        current_eval_cnt = int(pool.eval_cnt)
+        if current_eval_cnt >= self._last_pool_eval_cnt:
+            self._global_eval_cnt += (current_eval_cnt - self._last_pool_eval_cnt)
+        # If eval counter drops due rollback/reset, do not decrease global counter.
+        self._last_pool_eval_cnt = current_eval_cnt
         sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
  
         # Compute train ensemble IC

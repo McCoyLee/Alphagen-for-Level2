@@ -55,12 +55,18 @@ class Level2Callback(BaseCallback):
         self.conv_logger = convergence_logger
         self._plot_interval = plot_interval
         self._rollout_count = 0
+        self._global_eval_cnt = 0
+        self._last_pool_eval_cnt = 0
         os.makedirs(self.save_path, exist_ok=True)
     def _on_step(self) -> bool:
         return True
     def _on_rollout_end(self) -> None:
         self._rollout_count += 1
         pool = self.pool
+        current_eval_cnt = int(pool.eval_cnt)
+        if current_eval_cnt >= self._last_pool_eval_cnt:
+            self._global_eval_cnt += (current_eval_cnt - self._last_pool_eval_cnt)
+        self._last_pool_eval_cnt = current_eval_cnt
         sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
         self.logger.record('pool/size', pool.size)
         self.logger.record('pool/significant', sig_count)
@@ -90,7 +96,7 @@ class Level2Callback(BaseCallback):
                 pool_significant=sig_count,
                 pool_best_ic=pool.best_ic_ret,
                 pool_eval_cnt=pool.eval_cnt,
-                global_eval_cnt=pool.eval_cnt,
+                global_eval_cnt=self._global_eval_cnt,
                 train_ic=pool.best_ic_ret,
                 valid_ic=valid_ic,
                 valid_rank_ic=valid_rank_ic,
