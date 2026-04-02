@@ -35,12 +35,5 @@ txn_count = TxnCount = Feature(Level2FeatureType.TXN_COUNT)
 order_cancel_ratio = OrderCancelRatio = Feature(Level2FeatureType.ORDER_CANCEL_RATIO)
 net_order_flow = NetOrderFlow = Feature(Level2FeatureType.NET_ORDER_FLOW)
 
-# === Regime / conditional features ===
-volatility_regime = VolatilityRegime = Feature(Level2FeatureType.VOLATILITY_REGIME)
-volume_regime = VolumeRegime = Feature(Level2FeatureType.VOLUME_REGIME)
-spread_regime = SpreadRegime = Feature(Level2FeatureType.SPREAD_REGIME)
-trend_regime = TrendRegime = Feature(Level2FeatureType.TREND_REGIME)
-
-# Default target: forward return
-# For 3s bars: -4800 bars ≈ 1 trading day; for 3min bars: -80 bars ≈ 1 day
-target = Ref(close, -4800) / close - 1
+# Default target: 20-day forward return
+target = Ref(close, -20) / close - 1
