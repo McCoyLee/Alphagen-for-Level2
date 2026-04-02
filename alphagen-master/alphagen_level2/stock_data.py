@@ -46,6 +46,11 @@ class Level2FeatureType(IntEnum):
     TXN_COUNT = 17           # Number of trades in bar
     ORDER_CANCEL_RATIO = 18  # OrderKind=='D' count / total
     NET_ORDER_FLOW = 19      # (buy_vol - sell_vol) / total
+    # --- Regime / conditional features (computed post-hoc on bar tensor) ---
+    VOLATILITY_REGIME = 20   # Rolling realized vol percentile → 0=low, 1=mid, 2=high
+    VOLUME_REGIME = 21       # Rolling volume percentile → 0=quiet, 1=normal, 2=active
+    SPREAD_REGIME = 22       # Rolling spread percentile → 0=tight, 1=normal, 2=wide
+    TREND_REGIME = 23        # EMA fast vs slow → -1=down, 0=flat, +1=up
 # ---------------------------------------------------------------------------
 # Time utilities
 # ---------------------------------------------------------------------------
@@ -105,6 +110,138 @@ def _compute_bar_edges(bar_size_min: float) -> np.ndarray:
         edges.append(t)
         t += bar_size_min
     return np.array(edges, dtype=np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Regime / conditional feature computation (post-hoc on bar tensor)
+# ---------------------------------------------------------------------------
+def _compute_regime_features(
+    tensor: np.ndarray,
+    feat_idx: dict,
+    regime_window: int = 1200,
+) -> None:
+    """
+    Compute regime features in-place on the (n_bars, n_features, n_stocks) array.
+    Uses rolling statistics over `regime_window` bars to classify the current
+    market state into discrete regimes.
+
+    For 3s bars, regime_window=1200 → 1 hour lookback.
+
+    Args:
+        tensor: shape (n_bars, n_features, n_stocks), modified in-place
+        feat_idx: dict mapping feature name → index in dim-1
+        regime_window: lookback window in bars
+
+    Features computed:
+      VOLATILITY_REGIME: percentile of rolling close-return std → 0/1/2
+      VOLUME_REGIME: percentile of rolling volume mean → 0/1/2
+      SPREAD_REGIME: percentile of rolling spread mean → 0/1/2
+      TREND_REGIME: sign(EMA_fast - EMA_slow) → -1/0/+1
+    """
+    n_bars, n_feat, n_stocks = tensor.shape
+
+    # Check which regime features are present in the selected feature set
+    close_idx = feat_idx.get("CLOSE")
+    volume_idx = feat_idx.get("VOLUME")
+    spread_idx = feat_idx.get("BID_ASK_SPREAD")
+    vol_regime_idx = feat_idx.get("VOLATILITY_REGIME")
+    volm_regime_idx = feat_idx.get("VOLUME_REGIME")
+    spread_regime_idx = feat_idx.get("SPREAD_REGIME")
+    trend_regime_idx = feat_idx.get("TREND_REGIME")
+
+    if close_idx is None:
+        return  # Need at least close price
+
+    fast_span = max(regime_window // 6, 20)   # ~10min for 3s bars
+    slow_span = regime_window                   # ~1h for 3s bars
+
+    for si in range(n_stocks):
+        close = tensor[:, close_idx, si]
+
+        # --- Volatility regime ---
+        if vol_regime_idx is not None:
+            ret = np.diff(close, prepend=close[0]) / np.where(close != 0, close, 1.0)
+            vol_rolling = _rolling_std(ret, regime_window)
+            tensor[:, vol_regime_idx, si] = _percentile_regime(vol_rolling, regime_window)
+
+        # --- Volume regime ---
+        if volm_regime_idx is not None and volume_idx is not None:
+            volume = tensor[:, volume_idx, si]
+            vol_mean = _rolling_mean(volume, regime_window)
+            tensor[:, volm_regime_idx, si] = _percentile_regime(vol_mean, regime_window)
+
+        # --- Spread regime ---
+        if spread_regime_idx is not None and spread_idx is not None:
+            spread = tensor[:, spread_idx, si]
+            spread_mean = _rolling_mean(spread, regime_window)
+            tensor[:, spread_regime_idx, si] = _percentile_regime(spread_mean, regime_window)
+
+        # --- Trend regime: sign(EMA_fast - EMA_slow) ---
+        if trend_regime_idx is not None:
+            ema_fast = _ema(close, fast_span)
+            ema_slow = _ema(close, slow_span)
+            diff = ema_fast - ema_slow
+            threshold = _rolling_std(diff, regime_window) * 0.5
+            trend = np.where(diff > threshold, 1.0, np.where(diff < -threshold, -1.0, 0.0))
+            tensor[:, trend_regime_idx, si] = trend
+
+
+def _rolling_mean(arr: np.ndarray, window: int) -> np.ndarray:
+    """Simple rolling mean with NaN handling."""
+    out = np.full_like(arr, np.nan)
+    cumsum = np.nancumsum(arr)
+    out[window:] = (cumsum[window:] - cumsum[:-window]) / window
+    out[:window] = cumsum[:window] / np.arange(1, window + 1)
+    return out
+
+
+def _rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
+    """Rolling standard deviation."""
+    out = np.full_like(arr, np.nan)
+    for i in range(len(arr)):
+        start = max(0, i - window + 1)
+        seg = arr[start:i + 1]
+        valid = seg[~np.isnan(seg)]
+        if len(valid) > 1:
+            out[i] = np.std(valid)
+        elif len(valid) == 1:
+            out[i] = 0.0
+    return out
+
+
+def _ema(arr: np.ndarray, span: int) -> np.ndarray:
+    """Exponential moving average."""
+    alpha = 2.0 / (span + 1)
+    out = np.empty_like(arr)
+    out[0] = arr[0] if not np.isnan(arr[0]) else 0.0
+    for i in range(1, len(arr)):
+        v = arr[i] if not np.isnan(arr[i]) else out[i - 1]
+        out[i] = alpha * v + (1 - alpha) * out[i - 1]
+    return out
+
+
+def _percentile_regime(arr: np.ndarray, window: int) -> np.ndarray:
+    """Convert rolling values to 0/1/2 regime using expanding percentile."""
+    out = np.zeros_like(arr)
+    for i in range(len(arr)):
+        start = max(0, i - window + 1)
+        seg = arr[start:i + 1]
+        valid = seg[~np.isnan(seg)]
+        if len(valid) < 3:
+            continue
+        p33, p67 = np.percentile(valid, [33, 67])
+        v = arr[i]
+        if np.isnan(v):
+            continue
+        if v <= p33:
+            out[i] = 0.0
+        elif v >= p67:
+            out[i] = 2.0
+        else:
+            out[i] = 1.0
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Bar-level resampling (tick snapshots → N-min bars)
 # ---------------------------------------------------------------------------
@@ -491,6 +628,13 @@ class Level2StockData:
             for i, d in enumerate(selected_dates):
                 _, bar_off, day_vals = process_date((i, d))
                 values[bar_off:bar_off + n_bars_per_day] = day_vals
+        # Compute regime features if they are in the feature set
+        regime_feats = {Level2FeatureType.VOLATILITY_REGIME, Level2FeatureType.VOLUME_REGIME,
+                        Level2FeatureType.SPREAD_REGIME, Level2FeatureType.TREND_REGIME}
+        if regime_feats & set(self._features):
+            regime_window = max(int(60.0 / self._bar_size_min * 60), 100)  # ~1h lookback
+            _compute_regime_features(values, feat_idx=feat_idx, regime_window=regime_window)
+
         tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
         return tensor, bar_index, stock_ids
     def _resolve_stocks(self, reader: Level2HDF5Reader, dates: List[str]) -> List[str]:
