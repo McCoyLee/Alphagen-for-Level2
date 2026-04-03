@@ -33,7 +33,7 @@ OPERATORS: List[Type[Operator]] = [
 
 # 3s-bar delta times (units = bars)
 # 20=1min, 100=5min, 600=30min, 1200=1h, 4800≈1day
-DELTA_TIMES = [20, 100, 600, 1200, 4800]
+DELTA_TIMES = [10, 20, 100, 600, 1200]
 
 CONSTANTS = [-30., -10., -5., -2., -1., -0.5, -0.01, 0.01, 0.5, 1., 2., 5., 10., 30.]
 
