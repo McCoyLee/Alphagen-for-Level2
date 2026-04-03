@@ -350,10 +350,18 @@ class TickRollingCallback(BaseCallback):
 
     @property
     def env_core(self) -> AlphaEnvCore:
-        env = self.training_env.envs[0]
-        while hasattr(env, 'env'):
-            env = env.env
-        return env
+        vec_env = self.training_env
+        if hasattr(vec_env, 'envs'):
+            env = vec_env.envs[0]
+            while hasattr(env, 'env'):
+                env = env.env
+            return env
+        # SubprocVecEnv path: pull first worker's wrapper attr
+        if hasattr(vec_env, 'get_attr'):
+            cores = vec_env.get_attr('env')
+            if len(cores) > 0:
+                return cores[0]
+        raise AttributeError("Unable to locate AlphaEnvCore from current VecEnv")
 
 
 # ---------------------------------------------------------------------------
