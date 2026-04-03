@@ -166,32 +166,7 @@ PYTHONPATH=. python scripts/rl_tick_rolling.py -- --help
 - `run_config.json`
 - `rolling_results.json`
 
----
 
-## 7. 常见问题
-
-### Q1: 明明 `n_envs=1`，还是 GPU OOM？
-
-`n_envs` 不是唯一因素。表达式评估（尤其 `Cov/Corr/Std/Var/Mad` 等 rolling/pair rolling）会产生大中间张量。
-
-建议：
-
-1. 先缩小窗口（`train_months/valid_months/test_months`）
-2. 降 `max_backtrack_bars` / `max_future_bars`
-3. 必要时收窄 `DELTA_TIMES`（去掉 4800）
-4. 先关 LLM，再逐步打开
-
-### Q2: Subproc 训练出现 `EOFError`？
-
-常见是子进程 OOM 后主进程收不到返回。先把 `n_envs` 降到 1 排查，再逐步增加。
-
-### Q3: 单标的 IC 全 0？
-
-当前分支已在 `TickCalculator` 里加入单标的路径（时序归一化 + 时序 IC/RankIC）。
-
----
-
-## 8. 推荐调参顺序
 
 1. `n_envs=1` + `use_llm=False` 跑通
 2. 缩小窗口验证稳定性
