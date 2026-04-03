@@ -560,7 +560,7 @@ def train_one_window(
             chat_session = inter
 
     if n_envs > 1:
-        from stable_baselines3.common.vec_env import SubprocVecEnv
+        from stable_baselines3.common.vec_env import DummyVecEnv
 
         def make_env(print_expr: bool = False):
             def _init():
@@ -573,8 +573,8 @@ def train_one_window(
             return _init
 
         env_fns = [make_env(print_expr=True)] + [make_env(print_expr=False)] * (n_envs - 1)
-        env = SubprocVecEnv(env_fns)
-        print(f"[Window {wid}] Multi-env: {n_envs} parallel environments (SubprocVecEnv)")
+        env = DummyVecEnv(env_fns)
+        print(f"[Window {wid}] Multi-env: {n_envs} parallel environments (DummyVecEnv)")
     else:
         env = TickAlphaEnv(
             pool=pool,
