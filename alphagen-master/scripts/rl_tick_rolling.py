@@ -35,9 +35,9 @@ Usage:
 
 import json
 import os
-from typing import Optional, List, Union, Tuple
+from typing import Optional, List, Union, Tuple, Dict
 from datetime import datetime
-from collections import deque
+from collections import deque, defaultdict
 from dateutil.relativedelta import relativedelta
 
 import numpy as np
@@ -407,6 +407,81 @@ def build_rolling_schedule(
     return windows
 
 
+def build_stable_pool_from_results(
+    all_results: List[dict],
+    min_occurrence: int = 3,
+    min_sign_consistency: float = 0.6,
+    max_factors: int = 12,
+) -> Dict[str, object]:
+    """
+    Aggregate window final pools and select stable factors by:
+      1) occurrence count across windows
+      2) sign consistency of weights
+      3) median abs(weight)
+    """
+    stats = defaultdict(lambda: {"count": 0, "weights": [], "windows": []})
+    total_windows = len(all_results)
+
+    for result in all_results:
+        wid = result.get("window_id")
+        pool_path = result.get("pool_path")
+        if pool_path is None or (not os.path.exists(pool_path)):
+            continue
+        try:
+            with open(pool_path, "r") as f:
+                pool_data = json.load(f)
+        except Exception:
+            continue
+        exprs = pool_data.get("exprs", [])
+        weights = pool_data.get("weights", [])
+        n = min(len(exprs), len(weights))
+        for i in range(n):
+            expr = str(exprs[i]).strip()
+            w = float(weights[i])
+            if expr == "":
+                continue
+            s = stats[expr]
+            s["count"] += 1
+            s["weights"].append(w)
+            s["windows"].append(wid)
+
+    candidates = []
+    for expr, s in stats.items():
+        count = int(s["count"])
+        ws = np.array(s["weights"], dtype=float)
+        if count == 0:
+            continue
+        pos = int((ws > 0).sum())
+        neg = int((ws < 0).sum())
+        sign_consistency = max(pos, neg) / count
+        med_abs_w = float(np.median(np.abs(ws)))
+        if count >= min_occurrence and sign_consistency >= min_sign_consistency:
+            candidates.append({
+                "expr": expr,
+                "count": count,
+                "coverage": count / max(total_windows, 1),
+                "sign_consistency": sign_consistency,
+                "median_abs_weight": med_abs_w,
+                "mean_weight": float(ws.mean()),
+                "windows": s["windows"],
+            })
+
+    candidates.sort(
+        key=lambda x: (x["count"], x["sign_consistency"], x["median_abs_weight"]),
+        reverse=True,
+    )
+    selected = candidates[:max_factors]
+
+    return {
+        "total_windows": total_windows,
+        "min_occurrence": min_occurrence,
+        "min_sign_consistency": min_sign_consistency,
+        "max_factors": max_factors,
+        "n_candidates": len(candidates),
+        "selected": selected,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-window training
 # ---------------------------------------------------------------------------
@@ -439,6 +514,7 @@ def train_one_window(
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
     gentle_inject: bool = True,
+    llm_init_min_pool_size: int = 5,
     # Validation rollback controls
     valid_patience: int = 20,
     valid_min_delta: float = 1e-4,
@@ -563,6 +639,29 @@ def train_one_window(
         )
         print(f"[Window {wid}] LLM generating initial alpha pool...")
         pool = inter.run()
+
+        # Fallback: if LLM init pool is too small, bootstrap with robust seed expressions
+        if pool.size < llm_init_min_pool_size:
+            print(f"[Window {wid}] LLM init pool too small ({pool.size}), applying fallback seeds...")
+            parser = build_tick_parser()
+            seed_expr_strs = [
+                "Div(Sub($vwap,$close),Std($close,600))",
+                "EMA($imbalance_1,20)",
+                "Div(Sum($signed_volume,20),Sum($volume,20))",
+                "Corr($delta_bid_vol1,$ret,100)",
+                "Sub(EMA($spread_pct,20),EMA($spread_pct,600))",
+                "Mul($imbalance_total,Div($volume,Mean($volume,1200)))",
+            ]
+            merged_exprs = []
+            if hasattr(pool, "exprs"):
+                merged_exprs.extend(pool.exprs[:pool.size])
+            for s in seed_expr_strs:
+                try:
+                    merged_exprs.append(parser.parse(s))
+                except Exception:
+                    continue
+            if merged_exprs:
+                pool = build_pool(merged_exprs)
         print(f"[Window {wid}] Initial pool: {pool.size} alphas, IC={pool.best_ic_ret:.4f}")
         if use_llm:
             chat_session = inter
@@ -711,6 +810,7 @@ def main(
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
     gentle_inject: bool = True,
+    llm_init_min_pool_size: int = 5,
     # Validation rollback controls
     valid_patience: int = 20,
     valid_min_delta: float = 1e-4,
@@ -720,6 +820,10 @@ def main(
     n_envs: int = 1,
     # Warm-start
     warm_start: bool = True,
+    # Stable pool aggregation (step1)
+    stable_pool_min_occurrence: int = 3,
+    stable_pool_min_sign_consistency: float = 0.6,
+    stable_pool_max_factors: int = 12,
 ):
     """
     Walk-forward rolling-window RL alpha training on 3s tick-level data.
@@ -757,12 +861,16 @@ def main(
     :param llm_api_key: API key
     :param llm_model: Model name
     :param gentle_inject: Use gentle injection (True) or aggressive replacement
+    :param llm_init_min_pool_size: Minimum initial pool size after LLM warmstart
     :param valid_patience: Rollout patience before restoring best validation snapshot
     :param valid_min_delta: Minimum validation IC improvement to refresh best snapshot
     :param valid_smooth_window: Smoothing window for validation IC
     :param valid_restore_cooldown: Cooldown rollouts after restoration
     :param n_envs: Number of parallel environments
     :param warm_start: Carry forward pool across windows
+    :param stable_pool_min_occurrence: Min cross-window occurrence for stable factor
+    :param stable_pool_min_sign_consistency: Min sign consistency for stable factor
+    :param stable_pool_max_factors: Max selected stable factors
     """
     reseed_everything(seed)
 
@@ -807,9 +915,13 @@ def main(
         "llm_warmstart": llm_warmstart, "use_llm": use_llm,
         "llm_every_n_steps": llm_every_n_steps, "drop_rl_n": drop_rl_n,
         "llm_replace_n": llm_replace_n, "n_envs": n_envs,
+        "llm_init_min_pool_size": llm_init_min_pool_size,
         "valid_patience": valid_patience, "valid_min_delta": valid_min_delta,
         "valid_smooth_window": valid_smooth_window,
         "valid_restore_cooldown": valid_restore_cooldown,
+        "stable_pool_min_occurrence": stable_pool_min_occurrence,
+        "stable_pool_min_sign_consistency": stable_pool_min_sign_consistency,
+        "stable_pool_max_factors": stable_pool_max_factors,
         "schedule": schedule,
     }
     with open(os.path.join(save_root, "run_config.json"), "w") as f:
@@ -846,6 +958,7 @@ def main(
             llm_api_key=llm_api_key,
             llm_model=llm_model,
             gentle_inject=gentle_inject,
+            llm_init_min_pool_size=llm_init_min_pool_size,
             valid_patience=valid_patience,
             valid_min_delta=valid_min_delta,
             valid_smooth_window=valid_smooth_window,
@@ -857,6 +970,18 @@ def main(
 
         with open(os.path.join(save_root, "rolling_results.json"), "w") as f:
             json.dump(all_results, f, indent=2)
+
+    # Stable cross-window factor pool (step1)
+    stable_pool = build_stable_pool_from_results(
+        all_results=all_results,
+        min_occurrence=stable_pool_min_occurrence,
+        min_sign_consistency=stable_pool_min_sign_consistency,
+        max_factors=stable_pool_max_factors,
+    )
+    with open(os.path.join(save_root, "stable_factor_pool.json"), "w") as f:
+        json.dump(stable_pool, f, indent=2)
+    print(f"[Tick Rolling] Stable factor pool saved: {os.path.join(save_root, 'stable_factor_pool.json')}")
+    print(f"[Tick Rolling] Stable selected factors: {len(stable_pool.get('selected', []))}")
 
     # Summary
     print(f"\n{'='*70}")
