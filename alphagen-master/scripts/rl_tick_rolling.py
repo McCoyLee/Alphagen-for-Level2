@@ -792,11 +792,11 @@ def main(
     test_months: int = 6,
     step_months: int = 6,
     # Lookback / forward (in bars)
-    max_backtrack_bars: int = 4800,
-    max_future_bars: int = 1200,
+    max_backtrack_bars: int = 1200,
+    max_future_bars: int = 300,
     # IO
     cache_dir: Optional[str] = "./out/tick_cache",
-    max_workers: int = 4,
+    max_workers: int = 8,
     # Diversity
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
