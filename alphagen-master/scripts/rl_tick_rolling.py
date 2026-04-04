@@ -35,8 +35,9 @@ Usage:
 
 import json
 import os
-from typing import Optional, List, Union, Tuple
+from typing import Optional, List, Union, Tuple, Dict
 from datetime import datetime
+from collections import deque, defaultdict
 from dateutil.relativedelta import relativedelta
 
 import numpy as np
@@ -45,21 +46,62 @@ import fire
 from sb3_contrib.ppo_mask import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback
 
-from alphagen.data.expression import Feature, Ref, Expression
+from alphagen.data.expression import Feature, Ref, Expression, Greater, Less, Sub
+from alphagen.data.parser import ExpressionParser
 from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool
 from alphagen.rl.policy import LSTMSharedNet
-from alphagen.utils import reseed_everything
+from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
 from alphagen_level2.stock_data_tick import TickStockData, TickFeatureType
 from alphagen_level2.calculator_tick import TickCalculator
 from alphagen_level2.env_wrapper_tick import TickAlphaEnv
-from alphagen_level2.config_tick import TICK_FEATURES, TICK_FEATURES_BASIC
+from alphagen_level2.config_tick import TICK_FEATURES, TICK_FEATURES_BASIC, OPERATORS as TICK_OPERATORS
 from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergence
 from alphagen_level2.diversity_pool import DiversityMseAlphaPool
+from alphagen_level2.llm_prompts_tick import get_tick_system_prompt
+
+from alphagen_llm.client import ChatClient, OpenAIClient, ChatConfig
+from alphagen_llm.prompts.interaction import InterativeSession, DefaultInteraction
+from alphagen_llm.prompts.common import safe_parse_list
 
 
 # ---------------------------------------------------------------------------
-# Callback (adapted from rl_level2.py for tick data)
+# Parser / LLM client
+# ---------------------------------------------------------------------------
+
+def build_tick_parser() -> ExpressionParser:
+    parser = ExpressionParser(
+        TICK_OPERATORS,
+        ignore_case=True,
+        non_positive_time_deltas_allowed=False,
+        additional_operator_mapping={
+            "Max": [Greater],
+            "Min": [Less],
+            "Delta": [Sub],
+        },
+    )
+    parser._features = {f.name.lower(): f for f in TickFeatureType}
+    return parser
+
+
+def build_tick_chat_client(
+    log_dir: str,
+    base_url: str = "http://10.2.1.205:8796/v1",
+    api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
+    model: str = "MiniMax-M2.5",
+) -> ChatClient:
+    from openai import OpenAI
+
+    logger = get_logger("llm", os.path.join(log_dir, "llm.log"))
+    return OpenAIClient(
+        client=OpenAI(base_url=base_url, api_key=api_key),
+        config=ChatConfig(system_prompt=get_tick_system_prompt(), logger=logger),
+        model=model,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Callback (aligned with rl_level2_llm.py for tick data)
 # ---------------------------------------------------------------------------
 
 class TickRollingCallback(BaseCallback):
@@ -71,6 +113,14 @@ class TickRollingCallback(BaseCallback):
         verbose: int = 0,
         convergence_logger: Optional[ConvergenceLogger] = None,
         plot_interval: int = 10,
+        chat_session: Optional[InterativeSession] = None,
+        llm_every_n_steps: int = 25_000,
+        drop_rl_n: int = 5,
+        gentle_inject: bool = True,
+        valid_patience: int = 20,
+        valid_min_delta: float = 1e-4,
+        valid_smooth_window: int = 1,
+        valid_restore_cooldown: int = 3,
     ):
         super().__init__(verbose)
         self.save_path = save_path
@@ -81,6 +131,21 @@ class TickRollingCallback(BaseCallback):
         self._rollout_count = 0
         self._global_eval_cnt = 0
         self._last_pool_eval_cnt = 0
+        self.chat_session = chat_session
+        self.llm_every_n_steps = llm_every_n_steps
+        self._drop_rl_n = drop_rl_n
+        self._gentle_inject = gentle_inject
+        self.llm_use_count = 0
+        self.last_llm_use = 0
+        self._valid_min_delta = valid_min_delta
+        self._valid_restore_cooldown = valid_restore_cooldown
+        self._valid_smooth_window = max(1, int(valid_smooth_window))
+        self._valid_hist: deque = deque(maxlen=self._valid_smooth_window)
+        self._valid_patience = valid_patience
+        self._best_valid_ic: float = -999.0
+        self._best_valid_snapshot: Optional[dict] = None
+        self._valid_no_improve_count: int = 0
+        self._valid_cooldown_count: int = 0
         os.makedirs(self.save_path, exist_ok=True)
 
     def _on_step(self) -> bool:
@@ -88,6 +153,8 @@ class TickRollingCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         self._rollout_count += 1
+        if self.chat_session is not None:
+            self._try_use_llm()
         pool = self.pool
 
         current_eval_cnt = int(pool.eval_cnt)
@@ -100,10 +167,9 @@ class TickRollingCallback(BaseCallback):
         self.logger.record('pool/significant', sig_count)
         self.logger.record('pool/best_ic_ret', pool.best_ic_ret)
         self.logger.record('pool/eval_cnt', pool.eval_cnt)
+        self.logger.record('pool/global_eval_cnt', self._global_eval_cnt)
 
-        valid_ic, valid_rank_ic = pool.test_ensemble(self.valid_calculator)
-        self.logger.record('valid/ic', valid_ic)
-        self.logger.record('valid/rank_ic', valid_rank_ic)
+        valid_ic_raw, valid_rank_ic_raw = pool.test_ensemble(self.valid_calculator)
 
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
@@ -119,6 +185,41 @@ class TickRollingCallback(BaseCallback):
         self.logger.record('test/ic_mean', ic_test_mean)
         self.logger.record('test/rank_ic_mean', rank_ic_test_mean)
 
+        self._valid_hist.append(valid_ic_raw)
+        valid_ic = float(np.mean(self._valid_hist))
+        if valid_ic >= self._best_valid_ic + self._valid_min_delta:
+            self._best_valid_ic = valid_ic
+            self._valid_no_improve_count = 0
+            self._best_valid_snapshot = {
+                "pool": pool.to_json_dict(),
+                "best_obj": float(pool.best_obj),
+                "best_ic_ret": float(pool.best_ic_ret),
+                "eval_cnt": int(pool.eval_cnt),
+            }
+        else:
+            if self._valid_cooldown_count > 0:
+                self._valid_cooldown_count -= 1
+            else:
+                self._valid_no_improve_count += 1
+
+        if (self._valid_patience > 0
+                and self._valid_no_improve_count >= self._valid_patience
+                and self._best_valid_snapshot is not None
+                and pool.size > 1):
+            self._restore_pool_snapshot()
+            self._valid_no_improve_count = 0
+            self._valid_cooldown_count = self._valid_restore_cooldown
+            if self.verbose > 0:
+                print(f"[Overfit] Valid IC stale for {self._valid_patience} rollouts, "
+                      f"restored best snapshot (valid IC={self._best_valid_ic:.4f})")
+
+        self.logger.record('valid/ic_raw', valid_ic_raw)
+        self.logger.record('valid/ic_smooth', valid_ic)
+        self.logger.record('valid/rank_ic_raw', valid_rank_ic_raw)
+        self.logger.record('valid/best_ic', self._best_valid_ic)
+        self.logger.record('valid/no_improve_count', self._valid_no_improve_count)
+        self.logger.record('valid/cooldown_count', self._valid_cooldown_count)
+
         if self.conv_logger is not None:
             self.conv_logger.record_step(
                 timestep=self.num_timesteps,
@@ -128,8 +229,8 @@ class TickRollingCallback(BaseCallback):
                 pool_eval_cnt=pool.eval_cnt,
                 global_eval_cnt=self._global_eval_cnt,
                 train_ic=pool.best_ic_ret,
-                valid_ic=valid_ic,
-                valid_rank_ic=valid_rank_ic,
+                valid_ic=valid_ic_raw,
+                valid_rank_ic=valid_rank_ic_raw,
                 test_results=test_results,
             )
             self.conv_logger.save_csv()
@@ -150,6 +251,98 @@ class TickRollingCallback(BaseCallback):
         with open(f'{path}_pool.json', 'w') as f:
             json.dump(self.pool.to_json_dict(), f)
 
+    def _try_use_llm(self) -> None:
+        n_steps = self.num_timesteps
+        if n_steps - self.last_llm_use < self.llm_every_n_steps:
+            return
+        self.last_llm_use = n_steps
+        self.llm_use_count += 1
+
+        assert self.chat_session is not None
+        self.chat_session.client.reset()
+        logger = self.chat_session.logger
+        logger.debug(
+            f"[Step: {n_steps}] Trying LLM (#{self.llm_use_count}): "
+            f"IC={self.pool.best_ic_ret:.4f}"
+        )
+        if self._gentle_inject:
+            self._gentle_llm_inject(logger)
+        else:
+            self._aggressive_llm_inject(logger)
+
+    def _restore_pool_snapshot(self) -> None:
+        if self._best_valid_snapshot is None:
+            return
+        pool = self.pool
+        parser = build_tick_parser()
+        snapshot = self._best_valid_snapshot
+        pool_snapshot = snapshot.get("pool", snapshot)
+        exprs = []
+        for expr_str in pool_snapshot.get("exprs", []):
+            try:
+                expr = parser.parse(expr_str)
+                exprs.append(expr)
+            except Exception:
+                continue
+        if not exprs:
+            return
+        weights = pool_snapshot.get("weights", None)
+        pool.leave_only([])
+        pool.force_load_exprs(exprs, weights=weights)
+        if "best_obj" in snapshot:
+            pool.best_obj = float(snapshot["best_obj"])
+        if "best_ic_ret" in snapshot:
+            pool.best_ic_ret = float(snapshot["best_ic_ret"])
+        if "eval_cnt" in snapshot:
+            pool.eval_cnt = int(snapshot["eval_cnt"])
+
+    def _aggressive_llm_inject(self, logger) -> None:
+        try:
+            remain_n = max(0, self.pool.size - self._drop_rl_n)
+            remain = self.pool.most_significant_indices(remain_n)
+            self.pool.leave_only(remain)
+            self.chat_session.update_pool(self.pool)
+        except Exception as e:
+            logger.warning(f"LLM invocation failed: {type(e).__name__}: {e}")
+
+    def _gentle_llm_inject(self, logger) -> None:
+        try:
+            report_str, _ = self.chat_session._generate_report(self.pool)
+            from alphagen_llm.prompts.common import alpha_phrase
+            n_request = self._drop_rl_n
+            prompt = (
+                "Here are the current alphas and their metrics:\n"
+                f"{report_str}\n"
+                f"Please generate {alpha_phrase(n_request, 'new')} that are "
+                "DIFFERENT from and COMPLEMENTARY to the existing ones. "
+                "Focus on capturing different market patterns. "
+                "One alpha per line, no numbering, nothing else."
+            )
+            lines = self.chat_session.client.chat_complete(prompt)
+            exprs, invalid = safe_parse_list(
+                lines.split("\n"), self.chat_session._parser
+            )
+            if invalid:
+                logger.debug(f"LLM invalid expressions: {invalid}")
+            accepted = 0
+            for expr in exprs:
+                old_obj = self.pool.best_obj
+                try:
+                    new_obj = self.pool.try_new_expr(expr)
+                    if new_obj > old_obj:
+                        accepted += 1
+                        logger.debug(f"  Accepted: {expr} (obj {old_obj:.4f} -> {new_obj:.4f})")
+                    else:
+                        logger.debug(f"  Rejected: {expr} (no improvement)")
+                except Exception as e:
+                    logger.debug(f"  Failed: {expr} ({e})")
+            logger.debug(
+                f"LLM gentle inject: generated {len(exprs)}, "
+                f"accepted {accepted}, pool size {self.pool.size}"
+            )
+        except Exception as e:
+            logger.warning(f"LLM gentle inject failed: {type(e).__name__}: {e}")
+
     @property
     def pool(self) -> LinearAlphaPool:
         assert isinstance(self.env_core.pool, LinearAlphaPool)
@@ -157,10 +350,18 @@ class TickRollingCallback(BaseCallback):
 
     @property
     def env_core(self) -> AlphaEnvCore:
-        env = self.training_env.envs[0]
-        while hasattr(env, 'env'):
-            env = env.env
-        return env
+        vec_env = self.training_env
+        if hasattr(vec_env, 'envs'):
+            env = vec_env.envs[0]
+            while hasattr(env, 'env'):
+                env = env.env
+            return env
+        # SubprocVecEnv path: pull first worker's wrapper attr
+        if hasattr(vec_env, 'get_attr'):
+            cores = vec_env.get_attr('env')
+            if len(cores) > 0:
+                return cores[0]
+        raise AttributeError("Unable to locate AlphaEnvCore from current VecEnv")
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +407,81 @@ def build_rolling_schedule(
     return windows
 
 
+def build_stable_pool_from_results(
+    all_results: List[dict],
+    min_occurrence: int = 3,
+    min_sign_consistency: float = 0.6,
+    max_factors: int = 12,
+) -> Dict[str, object]:
+    """
+    Aggregate window final pools and select stable factors by:
+      1) occurrence count across windows
+      2) sign consistency of weights
+      3) median abs(weight)
+    """
+    stats = defaultdict(lambda: {"count": 0, "weights": [], "windows": []})
+    total_windows = len(all_results)
+
+    for result in all_results:
+        wid = result.get("window_id")
+        pool_path = result.get("pool_path")
+        if pool_path is None or (not os.path.exists(pool_path)):
+            continue
+        try:
+            with open(pool_path, "r") as f:
+                pool_data = json.load(f)
+        except Exception:
+            continue
+        exprs = pool_data.get("exprs", [])
+        weights = pool_data.get("weights", [])
+        n = min(len(exprs), len(weights))
+        for i in range(n):
+            expr = str(exprs[i]).strip()
+            w = float(weights[i])
+            if expr == "":
+                continue
+            s = stats[expr]
+            s["count"] += 1
+            s["weights"].append(w)
+            s["windows"].append(wid)
+
+    candidates = []
+    for expr, s in stats.items():
+        count = int(s["count"])
+        ws = np.array(s["weights"], dtype=float)
+        if count == 0:
+            continue
+        pos = int((ws > 0).sum())
+        neg = int((ws < 0).sum())
+        sign_consistency = max(pos, neg) / count
+        med_abs_w = float(np.median(np.abs(ws)))
+        if count >= min_occurrence and sign_consistency >= min_sign_consistency:
+            candidates.append({
+                "expr": expr,
+                "count": count,
+                "coverage": count / max(total_windows, 1),
+                "sign_consistency": sign_consistency,
+                "median_abs_weight": med_abs_w,
+                "mean_weight": float(ws.mean()),
+                "windows": s["windows"],
+            })
+
+    candidates.sort(
+        key=lambda x: (x["count"], x["sign_consistency"], x["median_abs_weight"]),
+        reverse=True,
+    )
+    selected = candidates[:max_factors]
+
+    return {
+        "total_windows": total_windows,
+        "min_occurrence": min_occurrence,
+        "min_sign_consistency": min_sign_consistency,
+        "max_factors": max_factors,
+        "n_candidates": len(candidates),
+        "selected": selected,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-window training
 # ---------------------------------------------------------------------------
@@ -228,6 +504,24 @@ def train_one_window(
     prev_pool_path: Optional[str] = None,
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    # LLM options
+    llm_warmstart: bool = False,
+    use_llm: bool = False,
+    llm_every_n_steps: int = 25_000,
+    drop_rl_n: int = 5,
+    llm_replace_n: int = 3,
+    llm_base_url: str = "http://10.2.1.205:8796/v1",
+    llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
+    llm_model: str = "MiniMax-M2.5",
+    gentle_inject: bool = True,
+    llm_init_min_pool_size: int = 5,
+    # Validation rollback controls
+    valid_patience: int = 20,
+    valid_min_delta: float = 1e-4,
+    valid_smooth_window: int = 1,
+    valid_restore_cooldown: int = 3,
+    # Multi-env parallelism
+    n_envs: int = 1,
 ) -> dict:
     """Train one walk-forward window. Returns dict with results."""
     wid = window["window_id"]
@@ -278,24 +572,31 @@ def train_one_window(
 
     # Build pool
     use_diversity = diversity_bonus > 0 or ic_mut_threshold < 0.99
-    if use_diversity:
-        pool = DiversityMseAlphaPool(
-            capacity=pool_capacity,
-            calculator=calculators[0],
-            ic_lower_bound=None,
-            l1_alpha=5e-3,
-            device=device,
-            ic_mut_threshold=ic_mut_threshold,
-            diversity_bonus=diversity_bonus,
-        )
-    else:
-        pool = MseAlphaPool(
-            capacity=pool_capacity,
-            calculator=calculators[0],
-            ic_lower_bound=None,
-            l1_alpha=5e-3,
-            device=device,
-        )
+
+    def build_pool(exprs: Optional[List[Expression]] = None) -> MseAlphaPool:
+        if use_diversity:
+            p = DiversityMseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
+                device=device,
+                ic_mut_threshold=ic_mut_threshold,
+                diversity_bonus=diversity_bonus,
+            )
+        else:
+            p = MseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
+                device=device,
+            )
+        if exprs:
+            p.force_load_exprs(exprs)
+        return p
+
+    pool = build_pool()
 
     # Warm-start from previous window's pool
     if prev_pool_path is not None and os.path.exists(prev_pool_path):
@@ -304,12 +605,7 @@ def train_one_window(
             with open(prev_pool_path, "r") as f:
                 prev_state = json.load(f)
             if "exprs" in prev_state and len(prev_state["exprs"]) > 0:
-                from alphagen.data.parser import ExpressionParser
-                from alphagen_level2.config_tick import OPERATORS as TICK_OPERATORS
-                parser = ExpressionParser(
-                    TICK_OPERATORS, ignore_case=True,
-                    non_positive_time_deltas_allowed=False,
-                )
+                parser = build_tick_parser()
                 loaded_exprs = []
                 for expr_str in prev_state["exprs"]:
                     try:
@@ -322,12 +618,77 @@ def train_one_window(
         except Exception as e:
             print(f"  Warm-start failed: {e}")
 
-    env = TickAlphaEnv(
-        pool=pool,
-        use_all_features=(len(features) > 7),
-        device=device,
-        print_expr=True,
-    )
+    chat_session: Optional[InterativeSession] = None
+    if llm_warmstart or use_llm:
+        print(f"[Window {wid}] Setting up LLM client...")
+        chat_client = build_tick_chat_client(
+            log_dir=window_dir,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            model=llm_model,
+        )
+        parser = build_tick_parser()
+        inter = DefaultInteraction(
+            parser,
+            chat_client,
+            build_pool,
+            calculator_train=calculators[0],
+            calculators_test=[calculators[1]],
+            replace_k=llm_replace_n,
+            forgetful=True,
+        )
+        print(f"[Window {wid}] LLM generating initial alpha pool...")
+        pool = inter.run()
+
+        # Fallback: if LLM init pool is too small, bootstrap with robust seed expressions
+        if pool.size < llm_init_min_pool_size:
+            print(f"[Window {wid}] LLM init pool too small ({pool.size}), applying fallback seeds...")
+            parser = build_tick_parser()
+            seed_expr_strs = [
+                "Div(Sub($vwap,$close),Std($close,600))",
+                "EMA($imbalance_1,20)",
+                "Div(Sum($signed_volume,20),Sum($volume,20))",
+                "Corr($delta_bid_vol1,$ret,100)",
+                "Sub(EMA($spread_pct,20),EMA($spread_pct,600))",
+                "Mul($imbalance_total,Div($volume,Mean($volume,1200)))",
+            ]
+            merged_exprs = []
+            if hasattr(pool, "exprs"):
+                merged_exprs.extend(pool.exprs[:pool.size])
+            for s in seed_expr_strs:
+                try:
+                    merged_exprs.append(parser.parse(s))
+                except Exception:
+                    continue
+            if merged_exprs:
+                pool = build_pool(merged_exprs)
+        print(f"[Window {wid}] Initial pool: {pool.size} alphas, IC={pool.best_ic_ret:.4f}")
+        if use_llm:
+            chat_session = inter
+
+    if n_envs > 1:
+        from stable_baselines3.common.vec_env import SubprocVecEnv
+
+        def make_env(print_expr: bool = False):
+            def _init():
+                return TickAlphaEnv(
+                    pool=pool,
+                    use_all_features=(len(features) > 7),
+                    device=device,
+                    print_expr=print_expr,
+                )
+            return _init
+
+        env_fns = [make_env(print_expr=True)] + [make_env(print_expr=False)] * (n_envs - 1)
+        env = SubprocVecEnv(env_fns)
+        print(f"[Window {wid}] Multi-env: {n_envs} parallel environments (SubprocVecEnv)")
+    else:
+        env = TickAlphaEnv(
+            pool=pool,
+            use_all_features=(len(features) > 7),
+            device=device,
+            print_expr=True,
+        )
 
     conv_logger = ConvergenceLogger(save_dir=window_dir)
     callback = TickRollingCallback(
@@ -336,8 +697,18 @@ def train_one_window(
         test_calculators=calculators[2:],
         verbose=1,
         convergence_logger=conv_logger,
+        chat_session=chat_session,
+        llm_every_n_steps=llm_every_n_steps,
+        drop_rl_n=drop_rl_n,
+        gentle_inject=gentle_inject,
+        valid_patience=valid_patience,
+        valid_min_delta=valid_min_delta,
+        valid_smooth_window=valid_smooth_window,
+        valid_restore_cooldown=valid_restore_cooldown,
     )
 
+    batch_size = 128 * n_envs
+    n_steps = max(2048 // n_envs, 256)
     model = MaskablePPO(
         "MlpPolicy",
         env,
@@ -352,8 +723,8 @@ def train_one_window(
         ),
         gamma=1.,
         ent_coef=0.01,
-        batch_size=128,
-        n_steps=2048,
+        batch_size=batch_size,
+        n_steps=n_steps,
         tensorboard_log=os.path.join(save_root, "tensorboard"),
         device=device,
         verbose=1,
@@ -429,8 +800,30 @@ def main(
     # Diversity
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    # LLM options
+    llm_warmstart: bool = False,
+    use_llm: bool = False,
+    llm_every_n_steps: int = 25_000,
+    drop_rl_n: int = 5,
+    llm_replace_n: int = 3,
+    llm_base_url: str = "http://10.2.1.205:8796/v1",
+    llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
+    llm_model: str = "MiniMax-M2.5",
+    gentle_inject: bool = True,
+    llm_init_min_pool_size: int = 5,
+    # Validation rollback controls
+    valid_patience: int = 20,
+    valid_min_delta: float = 1e-4,
+    valid_smooth_window: int = 1,
+    valid_restore_cooldown: int = 3,
+    # Multi-env parallelism
+    n_envs: int = 1,
     # Warm-start
     warm_start: bool = True,
+    # Stable pool aggregation (step1)
+    stable_pool_min_occurrence: int = 3,
+    stable_pool_min_sign_consistency: float = 0.6,
+    stable_pool_max_factors: int = 12,
 ):
     """
     Walk-forward rolling-window RL alpha training on 3s tick-level data.
@@ -459,7 +852,25 @@ def main(
     :param max_workers: Parallel HDF5 IO threads
     :param ic_mut_threshold: Mutual IC rejection threshold
     :param diversity_bonus: Reward bonus for novel alphas
+    :param llm_warmstart: Use LLM to generate initial alpha pool
+    :param use_llm: Enable periodic LLM injection during RL training
+    :param llm_every_n_steps: Invoke LLM every N steps
+    :param drop_rl_n: Number of RL alphas to replace/inject per LLM round
+    :param llm_replace_n: Number of new alphas generated per LLM round
+    :param llm_base_url: OpenAI-compatible API base URL
+    :param llm_api_key: API key
+    :param llm_model: Model name
+    :param gentle_inject: Use gentle injection (True) or aggressive replacement
+    :param llm_init_min_pool_size: Minimum initial pool size after LLM warmstart
+    :param valid_patience: Rollout patience before restoring best validation snapshot
+    :param valid_min_delta: Minimum validation IC improvement to refresh best snapshot
+    :param valid_smooth_window: Smoothing window for validation IC
+    :param valid_restore_cooldown: Cooldown rollouts after restoration
+    :param n_envs: Number of parallel environments
     :param warm_start: Carry forward pool across windows
+    :param stable_pool_min_occurrence: Min cross-window occurrence for stable factor
+    :param stable_pool_min_sign_consistency: Min sign consistency for stable factor
+    :param stable_pool_max_factors: Max selected stable factors
     """
     reseed_everything(seed)
 
@@ -501,6 +912,16 @@ def main(
         "steps_per_window": steps_per_window, "bar_size_sec": bar_size_sec,
         "use_all_features": use_all_features, "n_features": len(features),
         "max_backtrack_bars": max_backtrack_bars, "max_future_bars": max_future_bars,
+        "llm_warmstart": llm_warmstart, "use_llm": use_llm,
+        "llm_every_n_steps": llm_every_n_steps, "drop_rl_n": drop_rl_n,
+        "llm_replace_n": llm_replace_n, "n_envs": n_envs,
+        "llm_init_min_pool_size": llm_init_min_pool_size,
+        "valid_patience": valid_patience, "valid_min_delta": valid_min_delta,
+        "valid_smooth_window": valid_smooth_window,
+        "valid_restore_cooldown": valid_restore_cooldown,
+        "stable_pool_min_occurrence": stable_pool_min_occurrence,
+        "stable_pool_min_sign_consistency": stable_pool_min_sign_consistency,
+        "stable_pool_max_factors": stable_pool_max_factors,
         "schedule": schedule,
     }
     with open(os.path.join(save_root, "run_config.json"), "w") as f:
@@ -528,12 +949,39 @@ def main(
             prev_pool_path=prev_pool_path if warm_start else None,
             ic_mut_threshold=ic_mut_threshold,
             diversity_bonus=diversity_bonus,
+            llm_warmstart=llm_warmstart,
+            use_llm=use_llm,
+            llm_every_n_steps=llm_every_n_steps,
+            drop_rl_n=drop_rl_n,
+            llm_replace_n=llm_replace_n,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
+            gentle_inject=gentle_inject,
+            llm_init_min_pool_size=llm_init_min_pool_size,
+            valid_patience=valid_patience,
+            valid_min_delta=valid_min_delta,
+            valid_smooth_window=valid_smooth_window,
+            valid_restore_cooldown=valid_restore_cooldown,
+            n_envs=n_envs,
         )
         all_results.append(result)
         prev_pool_path = result["pool_path"]
 
         with open(os.path.join(save_root, "rolling_results.json"), "w") as f:
             json.dump(all_results, f, indent=2)
+
+    # Stable cross-window factor pool (step1)
+    stable_pool = build_stable_pool_from_results(
+        all_results=all_results,
+        min_occurrence=stable_pool_min_occurrence,
+        min_sign_consistency=stable_pool_min_sign_consistency,
+        max_factors=stable_pool_max_factors,
+    )
+    with open(os.path.join(save_root, "stable_factor_pool.json"), "w") as f:
+        json.dump(stable_pool, f, indent=2)
+    print(f"[Tick Rolling] Stable factor pool saved: {os.path.join(save_root, 'stable_factor_pool.json')}")
+    print(f"[Tick Rolling] Stable selected factors: {len(stable_pool.get('selected', []))}")
 
     # Summary
     print(f"\n{'='*70}")
