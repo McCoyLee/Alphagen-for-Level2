@@ -515,6 +515,8 @@ def train_one_window(
     llm_model: str = "MiniMax-M2.5",
     gentle_inject: bool = True,
     llm_init_min_pool_size: int = 5,
+    llm_init_updates: int = 4,
+    llm_forgetful: bool = False,
     # Validation rollback controls
     valid_patience: int = 20,
     valid_min_delta: float = 1e-4,
@@ -635,10 +637,10 @@ def train_one_window(
             calculator_train=calculators[0],
             calculators_test=[calculators[1]],
             replace_k=llm_replace_n,
-            forgetful=True,
+            forgetful=llm_forgetful,
         )
         print(f"[Window {wid}] LLM generating initial alpha pool...")
-        pool = inter.run()
+        pool = inter.run(n_updates=llm_init_updates)
 
         # Fallback: if LLM init pool is too small, bootstrap with robust seed expressions
         if pool.size < llm_init_min_pool_size:
@@ -811,6 +813,8 @@ def main(
     llm_model: str = "MiniMax-M2.5",
     gentle_inject: bool = True,
     llm_init_min_pool_size: int = 5,
+    llm_init_updates: int = 4,
+    llm_forgetful: bool = False,
     # Validation rollback controls
     valid_patience: int = 20,
     valid_min_delta: float = 1e-4,
@@ -862,6 +866,8 @@ def main(
     :param llm_model: Model name
     :param gentle_inject: Use gentle injection (True) or aggressive replacement
     :param llm_init_min_pool_size: Minimum initial pool size after LLM warmstart
+    :param llm_init_updates: Number of LLM warmstart update rounds
+    :param llm_forgetful: Whether DefaultInteraction resets dialog each round
     :param valid_patience: Rollout patience before restoring best validation snapshot
     :param valid_min_delta: Minimum validation IC improvement to refresh best snapshot
     :param valid_smooth_window: Smoothing window for validation IC
@@ -916,6 +922,8 @@ def main(
         "llm_every_n_steps": llm_every_n_steps, "drop_rl_n": drop_rl_n,
         "llm_replace_n": llm_replace_n, "n_envs": n_envs,
         "llm_init_min_pool_size": llm_init_min_pool_size,
+        "llm_init_updates": llm_init_updates,
+        "llm_forgetful": llm_forgetful,
         "valid_patience": valid_patience, "valid_min_delta": valid_min_delta,
         "valid_smooth_window": valid_smooth_window,
         "valid_restore_cooldown": valid_restore_cooldown,
@@ -959,6 +967,8 @@ def main(
             llm_model=llm_model,
             gentle_inject=gentle_inject,
             llm_init_min_pool_size=llm_init_min_pool_size,
+            llm_init_updates=llm_init_updates,
+            llm_forgetful=llm_forgetful,
             valid_patience=valid_patience,
             valid_min_delta=valid_min_delta,
             valid_smooth_window=valid_smooth_window,

@@ -115,6 +115,8 @@
 - `llm_base_url`, `llm_api_key`, `llm_model`
 - `gentle_inject`
 - `llm_init_min_pool_size`（LLM 初始化池过小时自动回退填充）
+- `llm_init_updates`（LLM warmstart 的迭代轮数）
+- `llm_forgetful`（是否每轮重置对话上下文）
 
 ### 4.6 验证回滚参数
 
