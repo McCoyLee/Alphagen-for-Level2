@@ -497,6 +497,8 @@ class TickStockData:
     ) -> List[str]:
         if isinstance(self._instrument, list):
             return [code.lower() for code in self._instrument]
+        if isinstance(self._instrument, str) and self._instrument.lower() != "auto":
+            return [self._instrument.lower()]
         sample_dates = dates[::max(1, len(dates) // 10)][:10]
         stock_sets = []
         for d in sample_dates:
