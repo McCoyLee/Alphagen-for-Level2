@@ -939,42 +939,49 @@ def main(
     prev_pool_path = None
 
     for window in schedule:
-        result = train_one_window(
-            window=window,
-            instruments=instruments,
-            features=features,
-            bar_size_sec=bar_size_sec,
-            max_backtrack_bars=max_backtrack_bars,
-            max_future_bars=max_future_bars,
-            pool_capacity=pool_capacity,
-            steps=steps_per_window,
-            data_root=data_root,
-            cache_dir=cache_dir,
-            max_workers=max_workers,
-            device=device,
-            save_root=save_root,
-            seed=seed,
-            prev_pool_path=prev_pool_path if warm_start else None,
-            ic_mut_threshold=ic_mut_threshold,
-            diversity_bonus=diversity_bonus,
-            llm_warmstart=llm_warmstart,
-            use_llm=use_llm,
-            llm_every_n_steps=llm_every_n_steps,
-            drop_rl_n=drop_rl_n,
-            llm_replace_n=llm_replace_n,
-            llm_base_url=llm_base_url,
-            llm_api_key=llm_api_key,
-            llm_model=llm_model,
-            gentle_inject=gentle_inject,
-            llm_init_min_pool_size=llm_init_min_pool_size,
-            llm_init_updates=llm_init_updates,
-            llm_forgetful=llm_forgetful,
-            valid_patience=valid_patience,
-            valid_min_delta=valid_min_delta,
-            valid_smooth_window=valid_smooth_window,
-            valid_restore_cooldown=valid_restore_cooldown,
-            n_envs=n_envs,
-        )
+        try:
+            result = train_one_window(
+                window=window,
+                instruments=instruments,
+                features=features,
+                bar_size_sec=bar_size_sec,
+                max_backtrack_bars=max_backtrack_bars,
+                max_future_bars=max_future_bars,
+                pool_capacity=pool_capacity,
+                steps=steps_per_window,
+                data_root=data_root,
+                cache_dir=cache_dir,
+                max_workers=max_workers,
+                device=device,
+                save_root=save_root,
+                seed=seed,
+                prev_pool_path=prev_pool_path if warm_start else None,
+                ic_mut_threshold=ic_mut_threshold,
+                diversity_bonus=diversity_bonus,
+                llm_warmstart=llm_warmstart,
+                use_llm=use_llm,
+                llm_every_n_steps=llm_every_n_steps,
+                drop_rl_n=drop_rl_n,
+                llm_replace_n=llm_replace_n,
+                llm_base_url=llm_base_url,
+                llm_api_key=llm_api_key,
+                llm_model=llm_model,
+                gentle_inject=gentle_inject,
+                llm_init_min_pool_size=llm_init_min_pool_size,
+                llm_init_updates=llm_init_updates,
+                llm_forgetful=llm_forgetful,
+                valid_patience=valid_patience,
+                valid_min_delta=valid_min_delta,
+                valid_smooth_window=valid_smooth_window,
+                valid_restore_cooldown=valid_restore_cooldown,
+                n_envs=n_envs,
+            )
+        except ValueError as e:
+            if "No data in range" in str(e):
+                print(f"[Tick Rolling] Stop at window {window['window_id']}: {e}")
+                print("[Tick Rolling] Remaining windows are skipped due to unavailable date range.")
+                break
+            raise
         all_results.append(result)
         prev_pool_path = result["pool_path"]
 
@@ -992,6 +999,10 @@ def main(
         json.dump(stable_pool, f, indent=2)
     print(f"[Tick Rolling] Stable factor pool saved: {os.path.join(save_root, 'stable_factor_pool.json')}")
     print(f"[Tick Rolling] Stable selected factors: {len(stable_pool.get('selected', []))}")
+
+    if len(all_results) == 0:
+        print("[Tick Rolling] No completed window. Exiting after stable pool export.")
+        return
 
     # Summary
     print(f"\n{'='*70}")
