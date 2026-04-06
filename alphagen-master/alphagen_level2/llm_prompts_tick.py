@@ -12,11 +12,11 @@ The formulaic alphas are expressed as mathematical expressions.
 An expression can be a real constant between -30 and 30, an input feature, or an operator applied with its operands.
 
 The data is resampled into 3-second bars from Level 2 tick snapshots. All time references are in units of 3-second bars.
+  10 bars = 30 seconds
   20 bars = 1 minute
   100 bars = 5 minutes
   600 bars = 30 minutes
   1200 bars = 1 hour
-  4800 bars ≈ 1 trading day
 
 The input features available are (20 features total):
 
