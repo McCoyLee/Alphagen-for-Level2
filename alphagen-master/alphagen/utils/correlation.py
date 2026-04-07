@@ -38,8 +38,9 @@ def _batch_pearsonr_given_mask(
     y_mean, y_std = masked_mean_std(y, n, mask)
     cov = (x * y).sum(dim=1) / n - x_mean * y_mean
     stdmul = x_std * y_std
-    stdmul[(x_std < 1e-3) | (y_std < 1e-3)] = 1
-    corrs = cov / stdmul
+    low_var_mask = (x_std < 1e-3) | (y_std < 1e-3)
+    corrs = cov / stdmul.clamp(min=1e-9)
+    corrs[low_var_mask] = torch.nan
     return corrs
 
 

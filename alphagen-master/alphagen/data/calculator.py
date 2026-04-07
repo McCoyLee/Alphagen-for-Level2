@@ -63,10 +63,10 @@ class TensorAlphaCalculator(AlphaCalculator):
         return torch.sum(torch.stack(factors, dim=0), dim=0)
 
     def _calc_IC(self, value1: Tensor, value2: Tensor) -> float:
-        return batch_pearsonr(value1, value2).mean().item()
+        return batch_pearsonr(value1, value2).nanmean().item()
     
     def _calc_rIC(self, value1: Tensor, value2: Tensor) -> float:
-        return batch_spearmanr(value1, value2).mean().item()
+        return batch_spearmanr(value1, value2).nanmean().item()
     
     def _IR_from_batch(self, batch: Tensor) -> float:
         mean, std = batch.mean(), batch.std()
