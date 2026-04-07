@@ -78,7 +78,7 @@ EMA(x,t): exponential moving average in the past t bars
 Cov(x,y,t): covariance between two time-series in the past t bars
 Corr(x,y,t): correlation of two time-series in the past t bars
 
-Valid time spans (in bars): 20, 100, 600, 1200, 4800.
+Valid time spans (in bars): 10, 20, 100, 600, 1200.
 
 Some examples of formulaic alphas for 3s microstructure data:
 
@@ -114,7 +114,7 @@ Some examples of formulaic alphas for 3s microstructure data:
 - $delta_bid_vol1 and $delta_ask_vol1 capture order book dynamics (replenishment / withdrawal).
 - Combine price features ($ret, $vwap) with microstructure features for robust signals.
 - Do not use features or operators that are not listed above.
-- Time spans must be one of: 20, 100, 600, 1200, 4800 (in 3s bars).
+- Time spans must be one of: 10, 20, 100, 600, 1200 (in 3s bars).
 """
 
 

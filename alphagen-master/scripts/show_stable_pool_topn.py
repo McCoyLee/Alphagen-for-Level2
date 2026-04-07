@@ -96,6 +96,7 @@ def _resolve_or_build_stable_json(
     min_sign_consistency: float,
     max_factors: int,
     save_when_built: bool,
+    rebuild: bool,
 ) -> tuple[Path, Dict[str, Any]]:
     if stable_json:
         path = Path(stable_json)
@@ -109,9 +110,16 @@ def _resolve_or_build_stable_json(
 
     run_path = Path(run_dir)
     stable_path = run_path / DEFAULT_STABLE_NAME
-    if stable_path.exists():
+    if stable_path.exists() and not rebuild:
         with stable_path.open("r") as f:
-            return stable_path, json.load(f)
+            payload = json.load(f)
+        same_thresholds = (
+            int(payload.get("min_occurrence", -1)) == int(min_occurrence)
+            and float(payload.get("min_sign_consistency", -1.0)) == float(min_sign_consistency)
+            and int(payload.get("max_factors", -1)) == int(max_factors)
+        )
+        if same_thresholds:
+            return stable_path, payload
 
     # Fallback: build from existing window outputs.
     payload = _build_stable_from_run_dir(
@@ -148,6 +156,7 @@ def main() -> None:
     parser.add_argument("--min-occurrence", type=int, default=3, help="Fallback build: min windows an expr appears in")
     parser.add_argument("--min-sign-consistency", type=float, default=0.6, help="Fallback build: min sign consistency")
     parser.add_argument("--max-factors", type=int, default=12, help="Fallback build: max stable factors to keep")
+    parser.add_argument("--rebuild", action="store_true", help="Force rebuild from window final pools even if stable json exists")
     parser.add_argument("--no-save", action="store_true", help="Do not save generated stable_factor_pool.json")
     args = parser.parse_args()
 
@@ -158,6 +167,7 @@ def main() -> None:
         min_sign_consistency=args.min_sign_consistency,
         max_factors=args.max_factors,
         save_when_built=not args.no_save,
+        rebuild=args.rebuild,
     )
 
     selected: List[Dict[str, Any]] = payload.get("selected", [])
