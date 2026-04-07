@@ -428,8 +428,12 @@ class TickStockData:
         real_start_idx = max(0, start_idx - backtrack_dates)
         real_end_idx = min(len(all_dates) - 1, end_idx + future_dates)
         selected_dates = all_dates[real_start_idx:real_end_idx + 1]
-
-        stock_codes = self._resolve_stocks(reader, selected_dates)
+        # IMPORTANT:
+        # - selected_dates keeps future/backtrack margins for tensor buffering.
+        # - stock universe resolution should only use dates within [start, end]
+        #   to avoid survivorship bias from future-date availability.
+        stock_resolution_dates = all_dates[real_start_idx:end_idx + 1]
+        stock_codes = self._resolve_stocks(reader, stock_resolution_dates)
         if not stock_codes:
             raise ValueError("No stocks found in data")
         stock_ids = pd.Index(stock_codes)
