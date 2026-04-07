@@ -2,11 +2,11 @@
 Configuration for 3-second bar (tick-level) alpha generation.
 
 Bar mode: DELTA_TIMES are in units of 3s bars.
+  10 bars =  0.5 min
   20 bars =  1 min
   100 bars =  5 min
   600 bars = 30 min
   1200 bars =  1 h
-  4800 bars ≈  1 day (4h session = 14,400s / 3s)
 """
 
 from typing import Type, List
@@ -32,8 +32,8 @@ OPERATORS: List[Type[Operator]] = [
 ]
 
 # 3s-bar delta times (units = bars)
-# 20=1min, 100=5min, 600=30min, 1200=1h, 4800≈1day
-DELTA_TIMES = [20, 100, 600, 1200, 4800]
+# 10=0.5min, 20=1min, 100=5min, 600=30min, 1200=1h
+DELTA_TIMES = [10, 20, 100, 600, 1200]
 
 CONSTANTS = [-30., -10., -5., -2., -1., -0.5, -0.01, 0.01, 0.5, 1., 2., 5., 10., 30.]
 

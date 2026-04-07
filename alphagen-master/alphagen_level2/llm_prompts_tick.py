@@ -12,11 +12,11 @@ The formulaic alphas are expressed as mathematical expressions.
 An expression can be a real constant between -30 and 30, an input feature, or an operator applied with its operands.
 
 The data is resampled into 3-second bars from Level 2 tick snapshots. All time references are in units of 3-second bars.
+  10 bars = 30 seconds
   20 bars = 1 minute
   100 bars = 5 minutes
   600 bars = 30 minutes
   1200 bars = 1 hour
-  4800 bars ≈ 1 trading day
 
 The input features available are (20 features total):
 
@@ -78,7 +78,7 @@ EMA(x,t): exponential moving average in the past t bars
 Cov(x,y,t): covariance between two time-series in the past t bars
 Corr(x,y,t): correlation of two time-series in the past t bars
 
-Valid time spans (in bars): 20, 100, 600, 1200, 4800.
+Valid time spans (in bars): 10, 20, 100, 600, 1200.
 
 Some examples of formulaic alphas for 3s microstructure data:
 
@@ -114,7 +114,7 @@ Some examples of formulaic alphas for 3s microstructure data:
 - $delta_bid_vol1 and $delta_ask_vol1 capture order book dynamics (replenishment / withdrawal).
 - Combine price features ($ret, $vwap) with microstructure features for robust signals.
 - Do not use features or operators that are not listed above.
-- Time spans must be one of: 20, 100, 600, 1200, 4800 (in 3s bars).
+- Time spans must be one of: 10, 20, 100, 600, 1200 (in 3s bars).
 """
 
 
