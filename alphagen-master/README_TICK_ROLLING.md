@@ -176,6 +176,25 @@ PYTHONPATH=. python scripts/rl_tick_rolling.py -- --help
 - `rolling_results.json`
 - `stable_factor_pool.json`（跨窗口稳定因子筛选结果）
 
+### 6.1 查看 stable pool Top-N（无需重跑训练）
+
+可直接使用：
+
+```bash
+python scripts/show_stable_pool_topn.py \
+  --run-dir out/tick_rolling/tick_3s_pool20_seed0_20260403060052 \
+  --top-n 20 \
+  --min-occurrence 2 \
+  --min-sign-consistency 0.67 \
+  --max-factors 12
+```
+
+说明：
+- 如果目录下已有 `stable_factor_pool.json`，脚本会先检查该文件里的阈值是否和当前命令一致；
+- 若阈值不一致，脚本会自动基于 `window_*/final_pool.json` 重建 stable pool；
+- 也可以显式加 `--rebuild` 强制重建；
+- `--no-save` 可只看结果不落盘。
+
 ---
 
 ## 7. 常见问题
@@ -198,6 +217,23 @@ PYTHONPATH=. python scripts/rl_tick_rolling.py -- --help
 ### Q3: 单标的 IC 全 0？
 
 当前分支已在 `TickCalculator` 里加入单标的路径（时序归一化 + 时序 IC/RankIC）。
+
+### Q4: 改了 `min-occurrence` / `min-sign-consistency`，结果却没变？
+
+先确认你使用的是最新 `scripts/show_stable_pool_topn.py`。  
+该脚本会在阈值变化时自动重建；若想绝对避免旧结果影响，直接加：
+
+```bash
+python scripts/show_stable_pool_topn.py --run-dir <run_dir> --rebuild ...
+```
+
+### Q5: `n_candidates > 0` 但实盘候选不稳，怎么筛？
+
+建议分两层：
+1. **Core**：`count >= 3` 且 `sign_consistency >= 0.75`
+2. **Candidate**：`count >= 2` 且 `sign_consistency >= 0.67`
+
+注意：Top-N 排序是 `count -> sign_consistency -> median_abs_weight`，并非直接收益排序。
 
 ---
 
