@@ -110,12 +110,21 @@ def simulate_pnl(
     # ── Walk through days, doing non-overlapping intraday trades ─────────
     day_starts = list(range(0, n, bars_per_day))
 
-    # Rolling z-score state (exponential for efficiency)
+    # ── Pre-process signal: forward-fill NaN then fill remaining with 0 ──
+    # Rolling operators (Mad, WMA, etc.) propagate NaN across windows when
+    # the underlying feature has missing bars (no ticks). Forward-filling
+    # preserves the last valid signal value, which is more appropriate than
+    # substituting 0 for a momentum/MAD-based signal.
+    signal_series = pd.Series(signal, dtype=np.float64)
+    signal_series = signal_series.ffill().fillna(0.0)
+    signal_clean = signal_series.to_numpy()
+
+    # Rolling z-score state
     zscore_window = holding_bars  # use holding period as zscore lookback
-    z_mean = pd.Series(signal, dtype=np.float64).rolling(
+    z_mean = signal_series.rolling(
         zscore_window, min_periods=max(zscore_window // 2, 1)
     ).mean().to_numpy()
-    z_std = pd.Series(signal, dtype=np.float64).rolling(
+    z_std = signal_series.rolling(
         zscore_window, min_periods=max(zscore_window // 2, 1)
     ).std(ddof=0).to_numpy()
 
@@ -126,10 +135,15 @@ def simulate_pnl(
         while t + holding_bars <= day_end:
             # ── Compute position using signal z-score at entry ────────
             std_val = z_std[t]
-            if std_val is None or np.isnan(std_val) or std_val < 1e-12:
+            mean_val = z_mean[t]
+            # Guard both std and mean against NaN/degenerate values
+            if (np.isnan(std_val) or std_val < 1e-12 or np.isnan(mean_val)):
                 t += holding_bars
                 continue
-            z = (signal[t] - z_mean[t]) / std_val
+            z = (signal_clean[t] - mean_val) / std_val
+            if np.isnan(z):  # should not happen after above guards, but be safe
+                t += holding_bars
+                continue
             z = np.clip(z, -3.0, 3.0) / 3.0  # normalize to [-1, 1]
             pos = z * direction
 
@@ -185,26 +199,36 @@ def simulate_pnl(
     n_calendar_days = len(day_starts)
     daily_pnl = np.zeros(n_calendar_days, dtype=np.float64)
     for tr in trades:
-        daily_pnl[tr["day"]] += tr["pnl"]
+        pnl_val = tr["pnl"]
+        if not np.isnan(pnl_val):   # guard: skip any trade with NaN pnl
+            daily_pnl[tr["day"]] += pnl_val
 
     # ── Trim trailing zero-days (no data) ─────────────────────────────────
     last_trade_day = max(tr["day"] for tr in trades)
     daily_pnl = daily_pnl[: last_trade_day + 1]
     cum_pnl = np.cumsum(daily_pnl)
 
-    # ── Metrics ───────────────────────────────────────────────────────────
+    # ── Metrics (robust to small samples) ────────────────────────────────
     ann_factor = 244
-    mean_daily = daily_pnl.mean()
-    std_daily = daily_pnl.std(ddof=1) + 1e-12
-    sharpe = mean_daily / std_daily * np.sqrt(ann_factor)
-    ann_return = mean_daily * ann_factor
+    valid_days = daily_pnl[daily_pnl != 0]   # days with actual trades
+    if len(valid_days) < 2:
+        mean_daily = float("nan")
+        std_daily = float("nan")
+        sharpe = float("nan")
+        ann_return = float("nan")
+    else:
+        mean_daily = valid_days.mean()
+        std_daily = valid_days.std(ddof=1)
+        sharpe = (mean_daily / std_daily * np.sqrt(ann_factor)
+                  if std_daily > 1e-12 else float("nan"))
+        ann_return = mean_daily * ann_factor
 
     rolling_max = np.maximum.accumulate(cum_pnl)
     drawdown = cum_pnl - rolling_max
     max_dd = drawdown.min() if len(drawdown) > 0 else 0.0
 
-    trade_pnls = np.array([t["pnl"] for t in trades])
-    win_rate = (trade_pnls > 0).mean()
+    trade_pnls = np.array([t["pnl"] for t in trades if not np.isnan(t["pnl"])])
+    win_rate = (trade_pnls > 0).mean() if len(trade_pnls) > 0 else float("nan")
 
     # ── IC: correlation of position with holding-period return ────────────
     positions = np.array([t["position"] for t in trades])
