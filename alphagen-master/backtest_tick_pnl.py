@@ -91,19 +91,30 @@ def simulate_pnl(
     direction: float,          # +1 or -1
     holding_bars: int = DEFAULT_HOLDING_BARS,
     cost_bps: float = COST_BPS,
+    pos_threshold: float = 0.05,   # minimum |position| to trade
+    execution_delay: int = 1,      # bars between signal observation and trade entry
+    zscore_window: int = 0,        # 0 = use holding_bars as window
 ) -> dict:
     """
     Non-overlapping trades aligned to `holding_bars` horizon.
 
-    At each trade entry `t`:
-      - signal_zscore = rolling zscore of signal up to t (lookback = holding_bars)
+    At each signal point `t`:
+      - signal_zscore = rolling zscore of signal using data up to bar t
       - position = clamp(zscore * direction, -1, 1)
-      - hold until t + holding_bars (or end of day, whichever first)
+      - enter at bar t + execution_delay  (default=1: one bar after signal)
+      - exit  at entry + holding_bars (or end of day)
       - trade_ret = close[exit] / close[entry] - 1
       - trade_pnl = position * trade_ret - |position| * cost_bps * 1e-4
+
+    execution_delay=1 (default) reflects the realistic constraint that a
+    3-second bar's signal is only fully known at bar-end, so the earliest
+    possible execution is at the NEXT bar. Setting delay=0 assumes same-bar
+    fill, which is unrealistic and inflates performance for point-in-time
+    microstructure signals like Div($open, $mid).
     """
     n = len(signal)
     cost_frac = cost_bps * 1e-4
+    zw = zscore_window if zscore_window > 0 else holding_bars
 
     trades = []     # list of {entry, exit, pos, ret, pnl}
 
@@ -119,43 +130,42 @@ def simulate_pnl(
     signal_series = signal_series.ffill().fillna(0.0)
     signal_clean = signal_series.to_numpy()
 
-    # Rolling z-score state
-    zscore_window = holding_bars  # use holding period as zscore lookback
+    # Rolling z-score (causal: only uses data up to current bar)
     z_mean = signal_series.rolling(
-        zscore_window, min_periods=max(zscore_window // 2, 1)
+        zw, min_periods=max(zw // 2, 1)
     ).mean().to_numpy()
     z_std = signal_series.rolling(
-        zscore_window, min_periods=max(zscore_window // 2, 1)
+        zw, min_periods=max(zw // 2, 1)
     ).std(ddof=0).to_numpy()
 
     for day_idx, day_start in enumerate(day_starts):
         day_end = min(day_start + bars_per_day, n)
 
-        t = day_start + zscore_window  # skip warm-up within day
-        while t + holding_bars <= day_end:
-            # ── Compute position using signal z-score at entry ────────
+        # Signal point t must leave room for entry delay + holding + exit
+        t = day_start + zw  # skip warm-up
+        while t + execution_delay + holding_bars <= day_end:
+            # ── Compute position at signal time t ─────────────────────
             std_val = z_std[t]
             mean_val = z_mean[t]
-            # Guard both std and mean against NaN/degenerate values
-            if (np.isnan(std_val) or std_val < 1e-12 or np.isnan(mean_val)):
+            if np.isnan(std_val) or std_val < 1e-12 or np.isnan(mean_val):
                 t += holding_bars
                 continue
             z = (signal_clean[t] - mean_val) / std_val
-            if np.isnan(z):  # should not happen after above guards, but be safe
+            if np.isnan(z):
                 t += holding_bars
                 continue
             z = np.clip(z, -3.0, 3.0) / 3.0  # normalize to [-1, 1]
             pos = z * direction
 
-            if abs(pos) < 0.05:     # dead zone: skip negligible positions
+            if abs(pos) < pos_threshold:  # dead zone
                 t += holding_bars
                 continue
 
-            # ── Compute return over holding period ────────────────────
-            entry_bar = t
-            exit_bar = t + holding_bars
-            # Clamp exit to end-of-day (flatten before close)
-            exit_bar = min(exit_bar, day_end - 1)
+            # ── Entry delayed by execution_delay bars ─────────────────
+            # Realistic: bar t ends → signal known → earliest fill = bar t+1
+            entry_bar = t + execution_delay
+            exit_bar = entry_bar + holding_bars
+            exit_bar = min(exit_bar, day_end - 1)  # flatten before close
 
             if exit_bar <= entry_bar:
                 t += holding_bars
@@ -179,7 +189,8 @@ def simulate_pnl(
                 "pnl": trade_pnl,
             })
 
-            t = exit_bar  # non-overlapping: next trade starts after exit
+            # Next signal point: after exit (non-overlapping)
+            t = exit_bar - execution_delay
 
     if not trades:
         return {
@@ -258,23 +269,27 @@ def auto_detect_direction(
     close: np.ndarray,
     holding_bars: int,
     calibration_frac: float = 0.2,
+    execution_delay: int = 1,
 ) -> float:
     """
     Use the first `calibration_frac` of data to detect the sign of the
-    factor's relationship with forward returns at the target horizon.
+    factor's correlation with forward returns at the target horizon,
+    accounting for execution_delay (signal at t → entry at t+delay).
     Returns +1 or -1.
     """
     n_cal = int(len(signal) * calibration_frac)
     if n_cal < holding_bars * 3:
-        return 1.0  # not enough data, default to +1
+        return 1.0
 
-    # Compute forward returns at holding horizon
+    # Forward return from entry (t+delay) to exit (t+delay+holding)
     fwd_ret = np.full(n_cal, np.nan, dtype=np.float64)
-    for t in range(n_cal - holding_bars):
-        if close[t] > 0 and not np.isnan(close[t]) and not np.isnan(close[t + holding_bars]):
-            fwd_ret[t] = close[t + holding_bars] / close[t] - 1.0
+    for t in range(n_cal - execution_delay - holding_bars):
+        entry = t + execution_delay
+        exit_ = entry + holding_bars
+        if (close[entry] > 0 and not np.isnan(close[entry])
+                and not np.isnan(close[exit_])):
+            fwd_ret[t] = close[exit_] / close[entry] - 1.0
 
-    # Correlation of raw signal with forward return
     valid = ~np.isnan(signal[:n_cal]) & ~np.isnan(fwd_ret)
     if valid.sum() < 30:
         return 1.0
@@ -372,13 +387,25 @@ def main():
                          "(overrides mean_w sign)")
     ap.add_argument("--max_backtrack", type=int, default=1200,
                     help="Max backtrack bars for factor lookback buffer")
+    ap.add_argument("--pos_threshold", type=float, default=0.05,
+                    help="Minimum |position| to enter a trade (default=0.05, "
+                         "try 0.3-0.5 to trade only on strong signals)")
+    ap.add_argument("--execution_delay", type=int, default=1,
+                    help="Bars between signal observation and trade entry "
+                         "(default=1: realistic; 0: same-bar fill, inflates perf "
+                         "for within-bar signals like Div($open,$mid))")
+    ap.add_argument("--zscore_window", type=int, default=0,
+                    help="Rolling z-score window in bars (default=0: use holding_bars)")
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Holding period: {args.holding_bars} bars "
+    print(f"Holding period:    {args.holding_bars} bars "
           f"({args.holding_bars * 3 / 60:.0f} min)")
-    print(f"Transaction cost: {args.cost_bps} bps RT")
+    print(f"Execution delay:   {args.execution_delay} bar(s) "
+          f"({'realistic' if args.execution_delay >= 1 else 'SAME-BAR (inflates perf)'})")
+    print(f"Transaction cost:  {args.cost_bps} bps RT")
+    print(f"Position threshold: {args.pos_threshold}")
 
     # ── Load tick data ────────────────────────────────────────────────────
     # Need max_future_days >= holding_bars so we can compute forward returns
@@ -440,7 +467,9 @@ def main():
         # ── Direction: from mean_w or auto-detect ─────────────────────
         if args.auto_direction:
             direction = auto_detect_direction(
-                signal, close, args.holding_bars, calibration_frac=0.2,
+                signal, close, args.holding_bars,
+                calibration_frac=0.2,
+                execution_delay=args.execution_delay,
             )
             dir_label = f"auto({'+'if direction>0 else '-'})"
         else:
@@ -455,6 +484,9 @@ def main():
             direction=direction,
             holding_bars=args.holding_bars,
             cost_bps=args.cost_bps,
+            pos_threshold=args.pos_threshold,
+            execution_delay=args.execution_delay,
+            zscore_window=args.zscore_window,
         )
         res["name"] = name
         res["expr"] = expr_str
