@@ -32,6 +32,7 @@ Usage:
 import argparse
 import sys
 import os
+import json
 import numpy as np
 import torch
 import pandas as pd
@@ -151,6 +152,47 @@ FACTORS = [
         "mean_w": +0.04018,
     },
 ]
+
+
+def load_factors(path: str):
+    """
+    Load factors from:
+      1) final_pool.json style: {"exprs": [...], "weights": [...]}
+      2) stable_factor_pool.json style: {"selected": [{"expr": "...", "mean_weight": ...}, ...]}
+    """
+    with open(path, "r") as f:
+        obj = json.load(f)
+
+    factors = []
+    if isinstance(obj, dict) and "exprs" in obj:
+        exprs = obj.get("exprs", [])
+        ws = obj.get("weights", [1.0] * len(exprs))
+        for i, expr in enumerate(exprs):
+            if not str(expr).strip():
+                continue
+            w = float(ws[i]) if i < len(ws) else 1.0
+            factors.append({
+                "name": f"PoolExpr#{i+1}",
+                "expr": str(expr),
+                "mean_w": w,
+            })
+        return factors
+
+    if isinstance(obj, dict) and "selected" in obj:
+        selected = obj.get("selected", [])
+        for i, item in enumerate(selected):
+            expr = str(item.get("expr", "")).strip()
+            if not expr:
+                continue
+            w = float(item.get("mean_weight", 1.0))
+            factors.append({
+                "name": f"StableExpr#{i+1}",
+                "expr": expr,
+                "mean_w": w,
+            })
+        return factors
+
+    raise ValueError(f"Unsupported factor file format: {path}")
  
 # ── Backtest parameters ───────────────────────────────────────────────────────
 DEFAULT_HOLDING_BARS = 100  # match training target: Ref(mid_prc,-100)/mid_prc-1
@@ -524,6 +566,15 @@ def main():
             "'train_compatible' uses TickCalculator target IC (same style as training)."
         ),
     )
+    ap.add_argument(
+        "--factors_json",
+        type=str,
+        default=None,
+        help=(
+            "Optional factor file path. Supports final_pool.json (exprs+weights) "
+            "or stable_factor_pool.json (selected list). If unset, uses built-in FACTORS."
+        ),
+    )
     args = ap.parse_args()
  
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -532,6 +583,10 @@ def main():
           f"({args.holding_bars * 3 / 60:.0f} min)")
     print(f"Transaction cost: {args.cost_bps} bps RT")
     print(f"Factor IC mode: {args.factor_ic_mode}")
+    if args.factors_json:
+        print(f"Factor source: {args.factors_json}")
+    else:
+        print("Factor source: built-in FACTORS list")
  
     # ── Load tick data ────────────────────────────────────────────────────
     # Need max_future_days >= holding_bars for train-compatible IC target
@@ -570,7 +625,13 @@ def main():
         train_style_target = Ref(mid_expr, -args.holding_bars) / mid_expr - 1
         ic_calculator = TickCalculator(data, train_style_target)
     all_results = []
- 
+    factors_to_eval = FACTORS
+    if args.factors_json is not None:
+        factors_to_eval = load_factors(args.factors_json)
+        if len(factors_to_eval) == 0:
+            print(f"No factors loaded from {args.factors_json}")
+            return
+
     header = (
         f"{'Factor':<28} {'Dir':>4} {'Sharpe':>7} {'AnnRet%':>8} "
         f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} {'WinRate':>8}"
@@ -579,7 +640,7 @@ def main():
     print(header)
     print("=" * len(header))
  
-    for fdef in FACTORS:
+    for fdef in factors_to_eval:
         name = fdef["name"]
         expr_str = fdef["expr"]
  
