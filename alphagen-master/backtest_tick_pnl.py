@@ -3,14 +3,14 @@ Tick-level P&L backtest for specific stable factors.
  
 Key design:
   - Uses HOLDING-PERIOD returns that MATCH the training target horizon
-    (default 1200 bars = 1 hour for 3s bars).
+    (default 100 bars = 5 minutes for 3s bars).
   - Non-overlapping trades: enter at signal, hold for `holding_bars`,
     exit, then re-enter at next signal → clean P&L accounting.
   - Positions flattened at day boundaries (intraday only).
   - Direction from `mean_w` sign (calibrated on same 1-hour target).
  
 Outputs:
-  - Printed summary: Sharpe, Ann.Return, MaxDD, IC
+  - Printed summary: Sharpe, Ann.Return, MaxDD, IC(factor), IC(strategy)
   - tick_pnl_backtest.png: P&L curves
   - tick_pnl_backtest_trades.csv: per-trade log
  
@@ -22,7 +22,7 @@ Usage:
         --start 2024-01-01 \\
         --end 2024-06-30
  
-    # Override holding period (default = 1200 bars = 1 hour):
+    # Override holding period (default = 100 bars ≈ 5 min):
     python backtest_tick_pnl.py --holding_bars 600   # 30 min
  
     # Auto-detect direction (ignore mean_w sign, use IC on first 20% of data):
@@ -32,6 +32,7 @@ Usage:
 import argparse
 import sys
 import os
+import json
 import numpy as np
 import torch
 import pandas as pd
@@ -40,6 +41,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
  
 from alphagen_level2.stock_data_tick import TickStockData, TickFeatureType
+from alphagen_level2.calculator_tick import TickCalculator
 from alphagen_level2.config_tick import TICK_FEATURES
 from alphagen.data.expression import Feature, Ref
 from alphagen.data.parser import ExpressionParser
@@ -65,10 +67,51 @@ FACTORS = [
         "mean_w": -0.04832,
     },
 ]
+
+
+def load_factors(path: str):
+    """
+    Load factors from:
+      1) final_pool.json style: {"exprs": [...], "weights": [...]}
+      2) stable_factor_pool.json style: {"selected": [{"expr": "...", "mean_weight": ...}, ...]}
+    """
+    with open(path, "r") as f:
+        obj = json.load(f)
+
+    factors = []
+    if isinstance(obj, dict) and "exprs" in obj:
+        exprs = obj.get("exprs", [])
+        ws = obj.get("weights", [1.0] * len(exprs))
+        for i, expr in enumerate(exprs):
+            if not str(expr).strip():
+                continue
+            w = float(ws[i]) if i < len(ws) else 1.0
+            factors.append({
+                "name": f"PoolExpr#{i+1}",
+                "expr": str(expr),
+                "mean_w": w,
+            })
+        return factors
+
+    if isinstance(obj, dict) and "selected" in obj:
+        selected = obj.get("selected", [])
+        for i, item in enumerate(selected):
+            expr = str(item.get("expr", "")).strip()
+            if not expr:
+                continue
+            w = float(item.get("mean_weight", 1.0))
+            factors.append({
+                "name": f"StableExpr#{i+1}",
+                "expr": expr,
+                "mean_w": w,
+            })
+        return factors
+
+    raise ValueError(f"Unsupported factor file format: {path}")
  
 # ── Backtest parameters ───────────────────────────────────────────────────────
-DEFAULT_HOLDING_BARS = 100  # match training target: Ref(close,-1200)/close-1
-COST_BPS = 0.5               # round-trip cost per trade (realistic for ETF)
+DEFAULT_HOLDING_BARS = 100  # match training target: Ref(mid_prc,-100)/mid_prc-1
+COST_BPS = 5.0               # round-trip cost per trade (ETF single-side 2.5 bps)
  
  
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -86,7 +129,7 @@ def build_parser() -> ExpressionParser:
 # ── Core P&L: non-overlapping fixed-holding trades ───────────────────────────
 def simulate_pnl(
     signal: np.ndarray,        # [n_bars], raw factor values
-    close: np.ndarray,         # [n_bars], close prices
+    mid_prc: np.ndarray,       # [n_bars], mid prices ((ask1+bid1)/2)
     bars_per_day: int,
     direction: float,          # +1 or -1
     holding_bars: int = DEFAULT_HOLDING_BARS,
@@ -100,7 +143,7 @@ def simulate_pnl(
       - signal_zscore = rolling zscore of signal up to t (lookback = holding_bars)
       - position = clamp(zscore * direction, -1, 1)
       - hold until t + holding_bars (or end of day, whichever first)
-      - trade_ret = close[exit] / close[entry] - 1
+      - trade_ret = mid_prc[exit] / mid_prc[entry] - 1
       - trade_pnl = position * trade_ret - |position| * cost_bps * 1e-4
     """
     n = len(signal)
@@ -121,7 +164,7 @@ def simulate_pnl(
     signal_clean = signal_series.to_numpy()
  
     # Rolling z-score state
-    zscore_window = 1200  # use holding period as zscore lookback
+    zscore_window = 600  # fixed z-score lookback per training setup
     z_mean = signal_series.rolling(
         zscore_window, min_periods=max(zscore_window // 2, 1)
     ).mean().to_numpy()
@@ -162,8 +205,8 @@ def simulate_pnl(
                 t += holding_bars
                 continue
  
-            entry_px = close[entry_bar]
-            exit_px = close[exit_bar]
+            entry_px = mid_prc[entry_bar]
+            exit_px = mid_prc[exit_bar]
             if np.isnan(entry_px) or np.isnan(exit_px) or entry_px <= 0:
                 t += holding_bars
                 continue
@@ -190,7 +233,7 @@ def simulate_pnl(
             "sharpe": float("nan"),
             "ann_return": float("nan"),
             "max_dd": float("nan"),
-            "ic": float("nan"),
+            "strategy_ic": float("nan"),
             "n_trades": 0,
             "n_full_days": 0,
             "win_rate": float("nan"),
@@ -231,14 +274,13 @@ def simulate_pnl(
     trade_pnls = np.array([t["pnl"] for t in trades if not np.isnan(t["pnl"])])
     win_rate = (trade_pnls > 0).mean() if len(trade_pnls) > 0 else float("nan")
  
-    # ── IC: correlation of position with holding-period return ────────────
+    # ── Strategy IC: correlation of executed position with realized return ─
+    # NOTE: This is a strategy-level metric (contains direction + sizing),
+    # not pure factor IC.
     positions = np.array([t["position"] for t in trades])
     returns = np.array([t["ret"] for t in trades])
     valid = ~np.isnan(positions) & ~np.isnan(returns) & (positions != 0)
-    if valid.sum() > 10:
-        ic = float(np.corrcoef(positions[valid], returns[valid])[0, 1])
-    else:
-        ic = float("nan")
+    strategy_ic = safe_corr(positions[valid], returns[valid], min_n=10)
  
     return {
         "trades": trades,
@@ -247,16 +289,64 @@ def simulate_pnl(
         "sharpe": sharpe,
         "ann_return": ann_return,
         "max_dd": max_dd,
-        "ic": ic,
+        "strategy_ic": strategy_ic,
         "n_trades": len(trades),
         "n_full_days": len(daily_pnl),
         "win_rate": win_rate,
     }
- 
- 
+
+
+def calc_factor_ic(
+    signal: np.ndarray,
+    mid_prc: np.ndarray,
+    bars_per_day: int,
+    holding_bars: int,
+    execution_delay: int = 1,
+):
+    """
+    Pure factor IC on all *eligible* decision points (no direction/position/deadzone).
+    Eligibility: t, t+delay, t+delay+holding all inside same trading day.
+    """
+    n = len(signal)
+    fwd_ret = np.full(n, np.nan, dtype=np.float64)
+    day_starts = list(range(0, n, bars_per_day))
+
+    for day_start in day_starts:
+        day_end = min(day_start + bars_per_day, n)
+        last_t = day_end - execution_delay - holding_bars
+        if last_t <= day_start:
+            continue
+        for t in range(day_start, last_t):
+            entry = t + execution_delay
+            exit_ = entry + holding_bars
+            p0 = mid_prc[entry]
+            p1 = mid_prc[exit_]
+            if np.isnan(p0) or np.isnan(p1) or p0 <= 0:
+                continue
+            fwd_ret[t] = p1 / p0 - 1.0
+
+    valid = ~np.isnan(signal) & ~np.isnan(fwd_ret)
+    n_valid = int(valid.sum())
+    ic = safe_corr(signal[valid], fwd_ret[valid], min_n=30)
+    return ic, n_valid
+
+
+def safe_corr(x: np.ndarray, y: np.ndarray, min_n: int = 30) -> float:
+    """NaN-safe Pearson correlation with std guard (prevents numpy warnings)."""
+    if x.size != y.size:
+        raise ValueError("x and y must have the same length.")
+    if x.size < min_n:
+        return float("nan")
+    sx = np.std(x)
+    sy = np.std(y)
+    if not np.isfinite(sx) or not np.isfinite(sy) or sx < 1e-12 or sy < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
 def auto_detect_direction(
     signal: np.ndarray,
-    close: np.ndarray,
+    mid_prc: np.ndarray,
     holding_bars: int,
     calibration_frac: float = 0.2,
     execution_delay: int = 1,
@@ -276,9 +366,9 @@ def auto_detect_direction(
     for t in range(n_cal - execution_delay - holding_bars):
         entry = t + execution_delay
         exit_ = entry + holding_bars
-        if (close[entry] > 0 and not np.isnan(close[entry])
-                and not np.isnan(close[exit_])):
-            fwd_ret[t] = close[exit_] / close[entry] - 1.0
+        if (mid_prc[entry] > 0 and not np.isnan(mid_prc[entry])
+                and not np.isnan(mid_prc[exit_])):
+            fwd_ret[t] = mid_prc[exit_] / mid_prc[entry] - 1.0
  
     valid = ~np.isnan(signal[:n_cal]) & ~np.isnan(fwd_ret)
     if valid.sum() < 30:
@@ -327,7 +417,8 @@ def plot_results(
             f"Sharpe: {r['sharpe']:.2f}  |  "
             f"AnnRet: {r['ann_return']*100:.1f}%  |  "
             f"MaxDD: {r['max_dd']*100:.1f}%  |  "
-            f"IC: {r['ic']:.4f}  |  "
+            f"IC(f): {r['factor_ic']:.4f}  |  "
+            f"IC(s): {r.get('strategy_ic', float('nan')):.4f}  |  "
             f"Trades: {r['n_trades']}  WinRate: {r['win_rate']*100:.0f}%"
         )
         ax.set_title(title, fontsize=9)
@@ -369,9 +460,9 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default="tick_pnl_backtest.png")
     ap.add_argument("--holding_bars", type=int, default=DEFAULT_HOLDING_BARS,
-                    help="Holding period in bars (default=1200=1hr, matching training target)")
+                    help="Holding period in bars (default=100≈5min, matching training target)")
     ap.add_argument("--cost_bps", type=float, default=COST_BPS,
-                    help="Round-trip transaction cost in bps (default=1.0)")
+                    help="Round-trip transaction cost in bps (default=5.0; single-side=2.5)")
     ap.add_argument("--auto_direction", action="store_true",
                     help="Auto-detect factor direction from first 20%% of data "
                          "(overrides mean_w sign)")
@@ -380,6 +471,25 @@ def main():
     ap.add_argument("--execution_delay", type=int, default=1,
                         help="Bars between signal observation and trade entry "
                             "(default=1: realistic; 0: same-bar fill, inflates perf ")
+    ap.add_argument(
+        "--factor_ic_mode",
+        choices=["intraday", "train_compatible"],
+        default="intraday",
+        help=(
+            "How to compute IC(f): "
+            "'intraday' uses tradable intraday points in backtest; "
+            "'train_compatible' uses TickCalculator target IC (same style as training)."
+        ),
+    )
+    ap.add_argument(
+        "--factors_json",
+        type=str,
+        default=None,
+        help=(
+            "Optional factor file path. Supports final_pool.json (exprs+weights) "
+            "or stable_factor_pool.json (selected list). If unset, uses built-in FACTORS."
+        ),
+    )
     args = ap.parse_args()
  
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -387,12 +497,18 @@ def main():
     print(f"Holding period: {args.holding_bars} bars "
           f"({args.holding_bars * 3 / 60:.0f} min)")
     print(f"Transaction cost: {args.cost_bps} bps RT")
+    print(f"Factor IC mode: {args.factor_ic_mode}")
+    if args.factors_json:
+        print(f"Factor source: {args.factors_json}")
+    else:
+        print("Factor source: built-in FACTORS list")
  
     # ── Load tick data ────────────────────────────────────────────────────
-    # Need max_future_days >= holding_bars so we can compute forward returns
-    # for the last few bars of data (used only by auto_direction calibration).
-    # For P&L itself, we stop trading `holding_bars` before day end anyway.
+    # Need max_future_days >= holding_bars for train-compatible IC target
+    # and auto_direction forward-return calibration.
+    # For P&L itself, we still stop trading `holding_bars` before day end anyway.
     print(f"\nLoading tick data: {args.instrument}  {args.start} -> {args.end}")
+    max_future = max(args.holding_bars + args.execution_delay, 0)
     data = TickStockData(
         instrument=[args.instrument],
         start_time=args.start,
@@ -401,7 +517,7 @@ def main():
         data_root=args.data_root,
         device=device,
         max_backtrack_days=args.max_backtrack,
-        max_future_days=0,
+        max_future_days=max_future,
     )
  
     bpd = data.bars_per_day
@@ -410,24 +526,36 @@ def main():
     print(f"  bars_per_day: {bpd}")
     print(f"  usable bars: {n_bars}  (~{n_days_approx} days)")
  
-    # ── Extract close prices (raw, for return computation) ────────────────
-    close_feat = Feature(TickFeatureType.CLOSE)
-    close_tensor = close_feat.evaluate(data)  # [n_bars, 1]
-    close = close_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
+    # ── Extract mid prices (raw, for return computation) ─────────────────
+    mid_feat = Feature(TickFeatureType.MID)
+    mid_tensor = mid_feat.evaluate(data)  # [n_bars, 1]
+    mid_prc = mid_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
  
     # ── Parse and evaluate each factor ────────────────────────────────────
     parser = build_parser()
+    # Training-compatible IC calculator (same IC definition path as training code)
+    ic_calculator = None
+    if args.factor_ic_mode == "train_compatible":
+        mid_expr = Feature(TickFeatureType.MID)
+        train_style_target = Ref(mid_expr, -args.holding_bars) / mid_expr - 1
+        ic_calculator = TickCalculator(data, train_style_target)
     all_results = []
- 
+    factors_to_eval = FACTORS
+    if args.factors_json is not None:
+        factors_to_eval = load_factors(args.factors_json)
+        if len(factors_to_eval) == 0:
+            print(f"No factors loaded from {args.factors_json}")
+            return
+
     header = (
         f"{'Factor':<28} {'Dir':>4} {'Sharpe':>7} {'AnnRet%':>8} "
-        f"{'MaxDD%':>8} {'IC':>8} {'#Trades':>8} {'WinRate':>8}"
+        f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} {'WinRate':>8}"
     )
     print("\n" + "=" * len(header))
     print(header)
     print("=" * len(header))
  
-    for fdef in FACTORS:
+    for fdef in factors_to_eval:
         name = fdef["name"]
         expr_str = fdef["expr"]
  
@@ -444,11 +572,24 @@ def main():
             continue
  
         signal = alpha_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
+        signal_clean = pd.Series(signal, dtype=np.float64).ffill().fillna(0.0).to_numpy()
+        if args.factor_ic_mode == "train_compatible":
+            assert ic_calculator is not None
+            factor_ic = float(ic_calculator.calc_single_IC_ret(expr))
+            ic_n = int(data.n_days)
+        else:
+            factor_ic, ic_n = calc_factor_ic(
+                signal_clean,
+                mid_prc,
+                bars_per_day=bpd,
+                holding_bars=args.holding_bars,
+                execution_delay=args.execution_delay,
+            )
  
         # ── Direction: from mean_w or auto-detect ─────────────────────
         if args.auto_direction:
             direction = auto_detect_direction(
-                signal, close, args.holding_bars, calibration_frac=0.2, execution_delay=args.execution_delay,
+                signal, mid_prc, args.holding_bars, calibration_frac=0.2, execution_delay=args.execution_delay,
             )
             dir_label = f"auto({'+'if direction>0 else '-'})"
         else:
@@ -458,7 +599,7 @@ def main():
         # ── Simulate P&L ──────────────────────────────────────────────
         res = simulate_pnl(
             signal=signal,
-            close=close,
+            mid_prc=mid_prc,
             bars_per_day=bpd,
             direction=direction,
             holding_bars=args.holding_bars,
@@ -468,6 +609,9 @@ def main():
         res["name"] = name
         res["expr"] = expr_str
         res["direction"] = direction
+        res.setdefault("strategy_ic", float("nan"))
+        res["factor_ic"] = factor_ic
+        res["factor_ic_n"] = ic_n
         all_results.append(res)
  
         print(
@@ -475,7 +619,8 @@ def main():
             f"{res['sharpe']:>7.2f} "
             f"{res['ann_return']*100:>8.2f} "
             f"{res['max_dd']*100:>8.2f} "
-            f"{res['ic']:>8.4f} "
+            f"{res['factor_ic']:>8.4f} "
+            f"{res.get('strategy_ic', float('nan')):>8.4f} "
             f"{res['n_trades']:>8d} "
             f"{res['win_rate']*100:>7.1f}%"
         )
