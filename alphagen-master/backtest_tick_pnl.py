@@ -534,10 +534,11 @@ def main():
     print(f"Factor IC mode: {args.factor_ic_mode}")
  
     # ── Load tick data ────────────────────────────────────────────────────
-    # Need max_future_days >= holding_bars so we can compute forward returns
-    # for the last few bars of data (used only by auto_direction calibration).
-    # For P&L itself, we stop trading `holding_bars` before day end anyway.
+    # Need max_future_days >= holding_bars for train-compatible IC target
+    # and auto_direction forward-return calibration.
+    # For P&L itself, we still stop trading `holding_bars` before day end anyway.
     print(f"\nLoading tick data: {args.instrument}  {args.start} -> {args.end}")
+    max_future = max(args.holding_bars + args.execution_delay, 0)
     data = TickStockData(
         instrument=[args.instrument],
         start_time=args.start,
@@ -546,7 +547,7 @@ def main():
         data_root=args.data_root,
         device=device,
         max_backtrack_days=args.max_backtrack,
-        max_future_days=0,
+        max_future_days=max_future,
     )
  
     bpd = data.bars_per_day
@@ -560,17 +561,14 @@ def main():
     mid_tensor = mid_feat.evaluate(data)  # [n_bars, 1]
     mid_prc = mid_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
  
-    # ── Extract mid prices (raw, for return computation) ─────────────────
-    mid_feat = Feature(TickFeatureType.MID)
-    mid_tensor = mid_feat.evaluate(data)  # [n_bars, 1]
-    mid_prc = mid_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
- 
     # ── Parse and evaluate each factor ────────────────────────────────────
     parser = build_parser()
     # Training-compatible IC calculator (same IC definition path as training code)
-    mid_expr = Feature(TickFeatureType.MID)
-    train_style_target = Ref(mid_expr, -args.holding_bars) / mid_expr - 1
-    ic_calculator = TickCalculator(data, train_style_target)
+    ic_calculator = None
+    if args.factor_ic_mode == "train_compatible":
+        mid_expr = Feature(TickFeatureType.MID)
+        train_style_target = Ref(mid_expr, -args.holding_bars) / mid_expr - 1
+        ic_calculator = TickCalculator(data, train_style_target)
     all_results = []
  
     header = (
@@ -600,6 +598,7 @@ def main():
         signal = alpha_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
         signal_clean = pd.Series(signal, dtype=np.float64).ffill().fillna(0.0).to_numpy()
         if args.factor_ic_mode == "train_compatible":
+            assert ic_calculator is not None
             factor_ic = float(ic_calculator.calc_single_IC_ret(expr))
             ic_n = int(data.n_days)
         else:
