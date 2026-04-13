@@ -3,7 +3,7 @@ Tick-level P&L backtest for specific stable factors.
  
 Key design:
   - Uses HOLDING-PERIOD returns that MATCH the training target horizon
-    (default 100 bars = 5 min for 3s bars).
+    (default 100 bars = 5 minutes for 3s bars).
   - Non-overlapping trades: enter at signal, hold for `holding_bars`,
     exit, then re-enter at next signal → clean P&L accounting.
   - Positions flattened at day boundaries (intraday only).
@@ -22,7 +22,7 @@ Usage:
         --start 2024-01-01 \\
         --end 2024-06-30
  
-    # Override holding period (default = 100 bars = 5 min):
+    # Override holding period (default = 100 bars ≈ 5 min):
     python backtest_tick_pnl.py --holding_bars 600   # 30 min
  
     # Auto-detect direction (ignore mean_w sign, use IC on first 20% of data):
@@ -40,6 +40,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
  
 from alphagen_level2.stock_data_tick import TickStockData, TickFeatureType
+from alphagen_level2.calculator_tick import TickCalculator
 from alphagen_level2.config_tick import TICK_FEATURES
 from alphagen.data.expression import Feature, Ref
 from alphagen.data.parser import ExpressionParser
@@ -152,8 +153,8 @@ FACTORS = [
 ]
  
 # ── Backtest parameters ───────────────────────────────────────────────────────
-DEFAULT_HOLDING_BARS = 100  # match training target: Ref(close,-100)/close-1
-COST_BPS = 5               # round-trip cost per trade (realistic for ETF)
+DEFAULT_HOLDING_BARS = 100  # match training target: Ref(mid_prc,-100)/mid_prc-1
+COST_BPS = 5.0               # round-trip cost per trade (ETF single-side 2.5 bps)
  
  
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -275,7 +276,7 @@ def simulate_pnl(
             "sharpe": float("nan"),
             "ann_return": float("nan"),
             "max_dd": float("nan"),
-            "ic": float("nan"),
+            "strategy_ic": float("nan"),
             "n_trades": 0,
             "n_full_days": 0,
             "win_rate": float("nan"),
@@ -336,7 +337,7 @@ def simulate_pnl(
         "n_full_days": len(daily_pnl),
         "win_rate": win_rate,
     }
- 
+
 
 def calc_factor_ic(
     signal: np.ndarray,
@@ -384,7 +385,8 @@ def safe_corr(x: np.ndarray, y: np.ndarray, min_n: int = 30) -> float:
     if not np.isfinite(sx) or not np.isfinite(sy) or sx < 1e-12 or sy < 1e-12:
         return float("nan")
     return float(np.corrcoef(x, y)[0, 1])
- 
+
+
 def auto_detect_direction(
     signal: np.ndarray,
     mid_prc: np.ndarray,
@@ -459,7 +461,7 @@ def plot_results(
             f"AnnRet: {r['ann_return']*100:.1f}%  |  "
             f"MaxDD: {r['max_dd']*100:.1f}%  |  "
             f"IC(f): {r['factor_ic']:.4f}  |  "
-            f"IC(s): {r['strategy_ic']:.4f}  |  "
+            f"IC(s): {r.get('strategy_ic', float('nan')):.4f}  |  "
             f"Trades: {r['n_trades']}  WinRate: {r['win_rate']*100:.0f}%"
         )
         ax.set_title(title, fontsize=9)
@@ -512,6 +514,16 @@ def main():
     ap.add_argument("--execution_delay", type=int, default=1,
                         help="Bars between signal observation and trade entry "
                             "(default=1: realistic; 0: same-bar fill, inflates perf ")
+    ap.add_argument(
+        "--factor_ic_mode",
+        choices=["intraday", "train_compatible"],
+        default="intraday",
+        help=(
+            "How to compute IC(f): "
+            "'intraday' uses tradable intraday points in backtest; "
+            "'train_compatible' uses TickCalculator target IC (same style as training)."
+        ),
+    )
     args = ap.parse_args()
  
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -519,6 +531,7 @@ def main():
     print(f"Holding period: {args.holding_bars} bars "
           f"({args.holding_bars * 3 / 60:.0f} min)")
     print(f"Transaction cost: {args.cost_bps} bps RT")
+    print(f"Factor IC mode: {args.factor_ic_mode}")
  
     # ── Load tick data ────────────────────────────────────────────────────
     # Need max_future_days >= holding_bars so we can compute forward returns
@@ -542,10 +555,10 @@ def main():
     print(f"  bars_per_day: {bpd}")
     print(f"  usable bars: {n_bars}  (~{n_days_approx} days)")
  
-    # ── Extract close prices (raw, for return computation) ────────────────
-    close_feat = Feature(TickFeatureType.CLOSE)
-    close_tensor = close_feat.evaluate(data)  # [n_bars, 1]
-    close = close_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
+    # ── Extract mid prices (raw, for return computation) ─────────────────
+    mid_feat = Feature(TickFeatureType.MID)
+    mid_tensor = mid_feat.evaluate(data)  # [n_bars, 1]
+    mid_prc = mid_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
  
     # ── Extract mid prices (raw, for return computation) ─────────────────
     mid_feat = Feature(TickFeatureType.MID)
@@ -554,6 +567,10 @@ def main():
  
     # ── Parse and evaluate each factor ────────────────────────────────────
     parser = build_parser()
+    # Training-compatible IC calculator (same IC definition path as training code)
+    mid_expr = Feature(TickFeatureType.MID)
+    train_style_target = Ref(mid_expr, -args.holding_bars) / mid_expr - 1
+    ic_calculator = TickCalculator(data, train_style_target)
     all_results = []
  
     header = (
@@ -582,13 +599,17 @@ def main():
  
         signal = alpha_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
         signal_clean = pd.Series(signal, dtype=np.float64).ffill().fillna(0.0).to_numpy()
-        factor_ic, ic_n = calc_factor_ic(
-            signal_clean,
-            mid_prc,
-            bars_per_day=bpd,
-            holding_bars=args.holding_bars,
-            execution_delay=args.execution_delay,
-        )
+        if args.factor_ic_mode == "train_compatible":
+            factor_ic = float(ic_calculator.calc_single_IC_ret(expr))
+            ic_n = int(data.n_days)
+        else:
+            factor_ic, ic_n = calc_factor_ic(
+                signal_clean,
+                mid_prc,
+                bars_per_day=bpd,
+                holding_bars=args.holding_bars,
+                execution_delay=args.execution_delay,
+            )
  
         # ── Direction: from mean_w or auto-detect ─────────────────────
         if args.auto_direction:
@@ -613,6 +634,7 @@ def main():
         res["name"] = name
         res["expr"] = expr_str
         res["direction"] = direction
+        res.setdefault("strategy_ic", float("nan"))
         res["factor_ic"] = factor_ic
         res["factor_ic_n"] = ic_n
         all_results.append(res)
@@ -623,7 +645,7 @@ def main():
             f"{res['ann_return']*100:>8.2f} "
             f"{res['max_dd']*100:>8.2f} "
             f"{res['factor_ic']:>8.4f} "
-            f"{res['strategy_ic']:>8.4f} "
+            f"{res.get('strategy_ic', float('nan')):>8.4f} "
             f"{res['n_trades']:>8d} "
             f"{res['win_rate']*100:>7.1f}%"
         )

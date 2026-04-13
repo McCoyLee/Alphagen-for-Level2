@@ -39,5 +39,5 @@ delta_bid_vol1 = DeltaBidVol1 = DELTA_BID_VOL1 = Feature(TickFeatureType.DELTA_B
 delta_ask_vol1 = DeltaAskVol1 = DELTA_ASK_VOL1 = Feature(TickFeatureType.DELTA_ASK_VOL1)
 signed_volume = SignedVolume = SIGNED_VOLUME = Feature(TickFeatureType.SIGNED_VOLUME)
 
-# Default target: forward return over 1200 bars ≈ 1 hour for 3s bars
-target = Ref(mid, -100) / close - 1
+# Default target: forward return over 100 bars ≈ 5 minutes for 3s bars
+target = Ref(mid, -100) / mid - 1

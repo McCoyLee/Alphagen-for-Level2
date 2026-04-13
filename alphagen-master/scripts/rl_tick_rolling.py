@@ -4,9 +4,9 @@ Rolling-window (walk-forward) RL alpha training on 3-second bar data.
 Designed for:
   - 3-second bars (bar_size_sec=3)
   - Single ETF instrument (e.g. 510300.sh)
-  - Time range 2023-2026
+  - Time range 2023-2025
   - 20 microstructure features
-  - Walk-forward windows: 1 year train, 6 months valid, 6 months test
+  - Walk-forward windows: 6 months train, 2 months valid, 2 months test
 
 Default schedule:
   Window 0: train 2023-01-01~2023-06-30, valid 2023-07-01~2023-08-31, test 2023-09-01~2023-10-31
