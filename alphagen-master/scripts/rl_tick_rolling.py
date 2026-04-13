@@ -850,7 +850,7 @@ def main(
     :param valid_months: Validation window in months
     :param test_months: Test window in months
     :param step_months: Rolling step size in months
-    :param max_backtrack_bars: Max lookback in bars (4800 ≈ 1 day)
+    :param max_backtrack_bars: Max lookback in bars (1200 ≈ 1 h)
     :param max_future_bars: Max forward look in bars (100 ≈ 5 minutes)
     :param cache_dir: Cache directory
     :param max_workers: Parallel HDF5 IO threads

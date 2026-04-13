@@ -52,19 +52,104 @@ from alphagen_level2.config_tick import OPERATORS as TICK_OPERATORS
 # ── Factors to backtest ───────────────────────────────────────────────────────
 FACTORS = [
     {
-        "name": "Open/Mid Ratio",
-        "expr": "Div($open,$mid)",
-        "mean_w": -0.05130,
+        "name": "High Inverse",
+        "expr": "Div(-0.5,$high)",
+        "mean_w": -0.01363,
     },
     {
-        "name": "SignedVol MAD(100)",
-        "expr": "Mad(Mul(1.0,$signed_volume),100d)",
-        "mean_w": +0.07062,
+        "name": "Bid-Ask Volume Imbalance Ratio",
+        "expr": "Div(Sub($bid_vol1,$ask_vol1),Add($bid_vol1,$ask_vol1))",
+        "mean_w": +0.05525,
     },
     {
-        "name": "Turnover WMA-GT(100)",
-        "expr": "Greater(-2.0,WMA(Greater($turnover,-0.5),100d))",
-        "mean_w": -0.04832,
+        "name": "Imbalance1 Sum Max Scaled",
+        "expr": "Div(Sub(-2.0,Max(Sum($imbalance_1,10d),600d)),-0.01)",
+        "mean_w": -0.04476,
+    },
+    {
+        "name": "Total Ask Mean(600)",
+        "expr": "Mean($total_ask,600d)",
+        "mean_w": -0.04811,
+    },
+    {
+        "name": "Total Bid Max Inverted",
+        "expr": "Sub(-1.0,Max($total_bid,600d))",
+        "mean_w": -0.04144,
+    },
+    {
+        "name": "Spread EMA Diff",
+        "expr": "Sub(EMA($spread_pct,20d),EMA($spread_pct,600d))",
+        "mean_w": +0.01626,
+    },
+    {
+        "name": "Volume-DeltaBidVol Nonlinear Max",
+        "expr": "Max(Sub(Div(-2.0,Div(Sub($volume,-1.0),$delta_bid_vol1)),-1.0),100d)",
+        "mean_w": +0.01632,
+    },
+    {
+        "name": "Turnover Min Threshold",
+        "expr": "Greater(-2.0,Min(Min($turnover,100d),100d))",
+        "mean_w": +0.01333,
+    },
+    {
+        "name": "Return-Mid Ratio Max",
+        "expr": "Max(Div(-2.0,Sub(Med($ret,100d),$mid)),100d)",
+        "mean_w": +0.03589,
+    },
+    {
+        "name": "Turnover Threshold Max",
+        "expr": "Max(Greater(-0.5,$turnover),600d)",
+        "mean_w": +0.02086,
+    },
+    {
+        "name": "Ask-Low Condition Delta Sum",
+        "expr": "Delta(Sum(Less(Greater(-2.0,$total_ask),$low),100d),100d)",
+        "mean_w": +0.01396,
+    },
+    {
+        "name": "ImbalanceTotal Sum Scaled",
+        "expr": "Mul(-2.0,Sum($imbalance_total,100d))",
+        "mean_w": +0.03630,
+    },
+    {
+        "name": "Return Mean Negative",
+        "expr": "Mul(-1.0,Mean($ret,100d))",
+        "mean_w": -0.01768,
+    },
+    {
+        "name": "ImbalanceTotal x Return Volatility",
+        "expr": "Mul($imbalance_total,Std($ret,100d))",
+        "mean_w": -0.04739,
+    },
+    {
+        "name": "VWAP Median Threshold",
+        "expr": "Greater(-0.5,Greater(Med($vwap,100d),-1.0))",
+        "mean_w": +0.01320,
+    },
+    {
+        "name": "DeltaBidVol vs Spread Max",
+        "expr": "Add(-1.0,Max(Greater($delta_bid_vol1,$spread_pct),20d))",
+        "mean_w": +0.01371,
+    },
+    {
+        "name": "Ask vs DeltaAskVol Condition",
+        "expr": "Greater(Max(Greater(-2.0,$total_ask),100d),$delta_ask_vol1)",
+        "mean_w": -0.03462,
+    },
+    {
+        "name": "Turnover Sum Threshold",
+        "expr": "Greater(-1.0,Sum($turnover,600d))",
+        "mean_w": -0.05133,
+    },
+    {
+        "name": "DeltaBidVol Max Inverted",
+        "expr": "Sub(1.0,Max($delta_bid_vol1,600d))",
+        "mean_w": +0.02076,
+    },
+    {
+        "name": "ImbalanceTotal Threshold",
+        "expr": "Greater(-0.5,$imbalance_total)",
+        "mean_w": +0.04018,
     },
 ]
 
@@ -455,8 +540,8 @@ def main():
     ap = argparse.ArgumentParser(description="Tick-level P&L backtest for stable factors")
     ap.add_argument("--data_root", default="/root/data/subset_data")
     ap.add_argument("--instrument", default="159845.sz")
-    ap.add_argument("--start", default="2025-7-01")
-    ap.add_argument("--end", default="2025-12-31")
+    ap.add_argument("--start", default="2025-9-01")
+    ap.add_argument("--end", default="2025-10-31")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default="tick_pnl_backtest.png")
     ap.add_argument("--holding_bars", type=int, default=DEFAULT_HOLDING_BARS,
