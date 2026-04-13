@@ -3,14 +3,14 @@ Tick-level P&L backtest for specific stable factors.
  
 Key design:
   - Uses HOLDING-PERIOD returns that MATCH the training target horizon
-    (default 1200 bars = 1 hour for 3s bars).
+    (default 100 bars = 5 min for 3s bars).
   - Non-overlapping trades: enter at signal, hold for `holding_bars`,
     exit, then re-enter at next signal → clean P&L accounting.
   - Positions flattened at day boundaries (intraday only).
   - Direction from `mean_w` sign (calibrated on same 1-hour target).
  
 Outputs:
-  - Printed summary: Sharpe, Ann.Return, MaxDD, IC
+  - Printed summary: Sharpe, Ann.Return, MaxDD, IC(factor), IC(strategy)
   - tick_pnl_backtest.png: P&L curves
   - tick_pnl_backtest_trades.csv: per-trade log
  
@@ -22,7 +22,7 @@ Usage:
         --start 2024-01-01 \\
         --end 2024-06-30
  
-    # Override holding period (default = 1200 bars = 1 hour):
+    # Override holding period (default = 100 bars = 5 min):
     python backtest_tick_pnl.py --holding_bars 600   # 30 min
  
     # Auto-detect direction (ignore mean_w sign, use IC on first 20% of data):
@@ -50,25 +50,110 @@ from alphagen_level2.config_tick import OPERATORS as TICK_OPERATORS
 # ── Factors to backtest ───────────────────────────────────────────────────────
 FACTORS = [
     {
-        "name": "Open/Mid Ratio",
-        "expr": "Div($open,$mid)",
-        "mean_w": -0.05130,
+        "name": "High Inverse",
+        "expr": "Div(-0.5,$high)",
+        "mean_w": -0.01363,
     },
     {
-        "name": "SignedVol MAD(100)",
-        "expr": "Mad(Mul(1.0,$signed_volume),100d)",
-        "mean_w": +0.07062,
+        "name": "Bid-Ask Volume Imbalance Ratio",
+        "expr": "Div(Sub($bid_vol1,$ask_vol1),Add($bid_vol1,$ask_vol1))",
+        "mean_w": +0.05525,
     },
     {
-        "name": "Turnover WMA-GT(100)",
-        "expr": "Greater(-2.0,WMA(Greater($turnover,-0.5),100d))",
-        "mean_w": -0.04832,
+        "name": "Imbalance1 Sum Max Scaled",
+        "expr": "Div(Sub(-2.0,Max(Sum($imbalance_1,10d),600d)),-0.01)",
+        "mean_w": -0.04476,
+    },
+    {
+        "name": "Total Ask Mean(600)",
+        "expr": "Mean($total_ask,600d)",
+        "mean_w": -0.04811,
+    },
+    {
+        "name": "Total Bid Max Inverted",
+        "expr": "Sub(-1.0,Max($total_bid,600d))",
+        "mean_w": -0.04144,
+    },
+    {
+        "name": "Spread EMA Diff",
+        "expr": "Sub(EMA($spread_pct,20d),EMA($spread_pct,600d))",
+        "mean_w": +0.01626,
+    },
+    {
+        "name": "Volume-DeltaBidVol Nonlinear Max",
+        "expr": "Max(Sub(Div(-2.0,Div(Sub($volume,-1.0),$delta_bid_vol1)),-1.0),100d)",
+        "mean_w": +0.01632,
+    },
+    {
+        "name": "Turnover Min Threshold",
+        "expr": "Greater(-2.0,Min(Min($turnover,100d),100d))",
+        "mean_w": +0.01333,
+    },
+    {
+        "name": "Return-Mid Ratio Max",
+        "expr": "Max(Div(-2.0,Sub(Med($ret,100d),$mid)),100d)",
+        "mean_w": +0.03589,
+    },
+    {
+        "name": "Turnover Threshold Max",
+        "expr": "Max(Greater(-0.5,$turnover),600d)",
+        "mean_w": +0.02086,
+    },
+    {
+        "name": "Ask-Low Condition Delta Sum",
+        "expr": "Delta(Sum(Less(Greater(-2.0,$total_ask),$low),100d),100d)",
+        "mean_w": +0.01396,
+    },
+    {
+        "name": "ImbalanceTotal Sum Scaled",
+        "expr": "Mul(-2.0,Sum($imbalance_total,100d))",
+        "mean_w": +0.03630,
+    },
+    {
+        "name": "Return Mean Negative",
+        "expr": "Mul(-1.0,Mean($ret,100d))",
+        "mean_w": -0.01768,
+    },
+    {
+        "name": "ImbalanceTotal x Return Volatility",
+        "expr": "Mul($imbalance_total,Std($ret,100d))",
+        "mean_w": -0.04739,
+    },
+    {
+        "name": "VWAP Median Threshold",
+        "expr": "Greater(-0.5,Greater(Med($vwap,100d),-1.0))",
+        "mean_w": +0.01320,
+    },
+    {
+        "name": "DeltaBidVol vs Spread Max",
+        "expr": "Add(-1.0,Max(Greater($delta_bid_vol1,$spread_pct),20d))",
+        "mean_w": +0.01371,
+    },
+    {
+        "name": "Ask vs DeltaAskVol Condition",
+        "expr": "Greater(Max(Greater(-2.0,$total_ask),100d),$delta_ask_vol1)",
+        "mean_w": -0.03462,
+    },
+    {
+        "name": "Turnover Sum Threshold",
+        "expr": "Greater(-1.0,Sum($turnover,600d))",
+        "mean_w": -0.05133,
+    },
+    {
+        "name": "DeltaBidVol Max Inverted",
+        "expr": "Sub(1.0,Max($delta_bid_vol1,600d))",
+        "mean_w": +0.02076,
+    },
+    {
+        "name": "ImbalanceTotal Threshold",
+        "expr": "Greater(-0.5,$imbalance_total)",
+        "mean_w": +0.04018,
     },
 ]
  
 # ── Backtest parameters ───────────────────────────────────────────────────────
-DEFAULT_HOLDING_BARS = 100  # match training target: Ref(close,-1200)/close-1
-COST_BPS = 0.5               # round-trip cost per trade (realistic for ETF)
+DEFAULT_HOLDING_BARS = 100  # match training target: Ref(close,-100)/close-1
+COST_BPS = 5               # round-trip cost per trade (realistic for ETF)
  
  
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -86,7 +171,7 @@ def build_parser() -> ExpressionParser:
 # ── Core P&L: non-overlapping fixed-holding trades ───────────────────────────
 def simulate_pnl(
     signal: np.ndarray,        # [n_bars], raw factor values
-    close: np.ndarray,         # [n_bars], close prices
+    mid_prc: np.ndarray,       # [n_bars], mid prices ((ask1+bid1)/2)
     bars_per_day: int,
     direction: float,          # +1 or -1
     holding_bars: int = DEFAULT_HOLDING_BARS,
@@ -100,7 +185,7 @@ def simulate_pnl(
       - signal_zscore = rolling zscore of signal up to t (lookback = holding_bars)
       - position = clamp(zscore * direction, -1, 1)
       - hold until t + holding_bars (or end of day, whichever first)
-      - trade_ret = close[exit] / close[entry] - 1
+      - trade_ret = mid_prc[exit] / mid_prc[entry] - 1
       - trade_pnl = position * trade_ret - |position| * cost_bps * 1e-4
     """
     n = len(signal)
@@ -121,7 +206,7 @@ def simulate_pnl(
     signal_clean = signal_series.to_numpy()
  
     # Rolling z-score state
-    zscore_window = 1200  # use holding period as zscore lookback
+    zscore_window = 600  # fixed z-score lookback per training setup
     z_mean = signal_series.rolling(
         zscore_window, min_periods=max(zscore_window // 2, 1)
     ).mean().to_numpy()
@@ -162,8 +247,8 @@ def simulate_pnl(
                 t += holding_bars
                 continue
  
-            entry_px = close[entry_bar]
-            exit_px = close[exit_bar]
+            entry_px = mid_prc[entry_bar]
+            exit_px = mid_prc[exit_bar]
             if np.isnan(entry_px) or np.isnan(exit_px) or entry_px <= 0:
                 t += holding_bars
                 continue
@@ -231,14 +316,13 @@ def simulate_pnl(
     trade_pnls = np.array([t["pnl"] for t in trades if not np.isnan(t["pnl"])])
     win_rate = (trade_pnls > 0).mean() if len(trade_pnls) > 0 else float("nan")
  
-    # ── IC: correlation of position with holding-period return ────────────
+    # ── Strategy IC: correlation of executed position with realized return ─
+    # NOTE: This is a strategy-level metric (contains direction + sizing),
+    # not pure factor IC.
     positions = np.array([t["position"] for t in trades])
     returns = np.array([t["ret"] for t in trades])
     valid = ~np.isnan(positions) & ~np.isnan(returns) & (positions != 0)
-    if valid.sum() > 10:
-        ic = float(np.corrcoef(positions[valid], returns[valid])[0, 1])
-    else:
-        ic = float("nan")
+    strategy_ic = safe_corr(positions[valid], returns[valid], min_n=10)
  
     return {
         "trades": trades,
@@ -247,16 +331,63 @@ def simulate_pnl(
         "sharpe": sharpe,
         "ann_return": ann_return,
         "max_dd": max_dd,
-        "ic": ic,
+        "strategy_ic": strategy_ic,
         "n_trades": len(trades),
         "n_full_days": len(daily_pnl),
         "win_rate": win_rate,
     }
  
+
+def calc_factor_ic(
+    signal: np.ndarray,
+    mid_prc: np.ndarray,
+    bars_per_day: int,
+    holding_bars: int,
+    execution_delay: int = 1,
+):
+    """
+    Pure factor IC on all *eligible* decision points (no direction/position/deadzone).
+    Eligibility: t, t+delay, t+delay+holding all inside same trading day.
+    """
+    n = len(signal)
+    fwd_ret = np.full(n, np.nan, dtype=np.float64)
+    day_starts = list(range(0, n, bars_per_day))
+
+    for day_start in day_starts:
+        day_end = min(day_start + bars_per_day, n)
+        last_t = day_end - execution_delay - holding_bars
+        if last_t <= day_start:
+            continue
+        for t in range(day_start, last_t):
+            entry = t + execution_delay
+            exit_ = entry + holding_bars
+            p0 = mid_prc[entry]
+            p1 = mid_prc[exit_]
+            if np.isnan(p0) or np.isnan(p1) or p0 <= 0:
+                continue
+            fwd_ret[t] = p1 / p0 - 1.0
+
+    valid = ~np.isnan(signal) & ~np.isnan(fwd_ret)
+    n_valid = int(valid.sum())
+    ic = safe_corr(signal[valid], fwd_ret[valid], min_n=30)
+    return ic, n_valid
+
+
+def safe_corr(x: np.ndarray, y: np.ndarray, min_n: int = 30) -> float:
+    """NaN-safe Pearson correlation with std guard (prevents numpy warnings)."""
+    if x.size != y.size:
+        raise ValueError("x and y must have the same length.")
+    if x.size < min_n:
+        return float("nan")
+    sx = np.std(x)
+    sy = np.std(y)
+    if not np.isfinite(sx) or not np.isfinite(sy) or sx < 1e-12 or sy < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
  
 def auto_detect_direction(
     signal: np.ndarray,
-    close: np.ndarray,
+    mid_prc: np.ndarray,
     holding_bars: int,
     calibration_frac: float = 0.2,
     execution_delay: int = 1,
@@ -276,9 +407,9 @@ def auto_detect_direction(
     for t in range(n_cal - execution_delay - holding_bars):
         entry = t + execution_delay
         exit_ = entry + holding_bars
-        if (close[entry] > 0 and not np.isnan(close[entry])
-                and not np.isnan(close[exit_])):
-            fwd_ret[t] = close[exit_] / close[entry] - 1.0
+        if (mid_prc[entry] > 0 and not np.isnan(mid_prc[entry])
+                and not np.isnan(mid_prc[exit_])):
+            fwd_ret[t] = mid_prc[exit_] / mid_prc[entry] - 1.0
  
     valid = ~np.isnan(signal[:n_cal]) & ~np.isnan(fwd_ret)
     if valid.sum() < 30:
@@ -327,7 +458,8 @@ def plot_results(
             f"Sharpe: {r['sharpe']:.2f}  |  "
             f"AnnRet: {r['ann_return']*100:.1f}%  |  "
             f"MaxDD: {r['max_dd']*100:.1f}%  |  "
-            f"IC: {r['ic']:.4f}  |  "
+            f"IC(f): {r['factor_ic']:.4f}  |  "
+            f"IC(s): {r['strategy_ic']:.4f}  |  "
             f"Trades: {r['n_trades']}  WinRate: {r['win_rate']*100:.0f}%"
         )
         ax.set_title(title, fontsize=9)
@@ -364,14 +496,14 @@ def main():
     ap = argparse.ArgumentParser(description="Tick-level P&L backtest for stable factors")
     ap.add_argument("--data_root", default="/root/data/subset_data")
     ap.add_argument("--instrument", default="159845.sz")
-    ap.add_argument("--start", default="2025-7-01")
-    ap.add_argument("--end", default="2025-12-31")
+    ap.add_argument("--start", default="2025-9-01")
+    ap.add_argument("--end", default="2025-10-31")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default="tick_pnl_backtest.png")
     ap.add_argument("--holding_bars", type=int, default=DEFAULT_HOLDING_BARS,
-                    help="Holding period in bars (default=1200=1hr, matching training target)")
+                    help="Holding period in bars (default=100≈5min, matching training target)")
     ap.add_argument("--cost_bps", type=float, default=COST_BPS,
-                    help="Round-trip transaction cost in bps (default=1.0)")
+                    help="Round-trip transaction cost in bps (default=5.0; single-side=2.5)")
     ap.add_argument("--auto_direction", action="store_true",
                     help="Auto-detect factor direction from first 20%% of data "
                          "(overrides mean_w sign)")
@@ -415,13 +547,18 @@ def main():
     close_tensor = close_feat.evaluate(data)  # [n_bars, 1]
     close = close_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
  
+    # ── Extract mid prices (raw, for return computation) ─────────────────
+    mid_feat = Feature(TickFeatureType.MID)
+    mid_tensor = mid_feat.evaluate(data)  # [n_bars, 1]
+    mid_prc = mid_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
+ 
     # ── Parse and evaluate each factor ────────────────────────────────────
     parser = build_parser()
     all_results = []
  
     header = (
         f"{'Factor':<28} {'Dir':>4} {'Sharpe':>7} {'AnnRet%':>8} "
-        f"{'MaxDD%':>8} {'IC':>8} {'#Trades':>8} {'WinRate':>8}"
+        f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} {'WinRate':>8}"
     )
     print("\n" + "=" * len(header))
     print(header)
@@ -444,11 +581,19 @@ def main():
             continue
  
         signal = alpha_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
+        signal_clean = pd.Series(signal, dtype=np.float64).ffill().fillna(0.0).to_numpy()
+        factor_ic, ic_n = calc_factor_ic(
+            signal_clean,
+            mid_prc,
+            bars_per_day=bpd,
+            holding_bars=args.holding_bars,
+            execution_delay=args.execution_delay,
+        )
  
         # ── Direction: from mean_w or auto-detect ─────────────────────
         if args.auto_direction:
             direction = auto_detect_direction(
-                signal, close, args.holding_bars, calibration_frac=0.2, execution_delay=args.execution_delay,
+                signal, mid_prc, args.holding_bars, calibration_frac=0.2, execution_delay=args.execution_delay,
             )
             dir_label = f"auto({'+'if direction>0 else '-'})"
         else:
@@ -458,7 +603,7 @@ def main():
         # ── Simulate P&L ──────────────────────────────────────────────
         res = simulate_pnl(
             signal=signal,
-            close=close,
+            mid_prc=mid_prc,
             bars_per_day=bpd,
             direction=direction,
             holding_bars=args.holding_bars,
@@ -468,6 +613,8 @@ def main():
         res["name"] = name
         res["expr"] = expr_str
         res["direction"] = direction
+        res["factor_ic"] = factor_ic
+        res["factor_ic_n"] = ic_n
         all_results.append(res)
  
         print(
@@ -475,7 +622,8 @@ def main():
             f"{res['sharpe']:>7.2f} "
             f"{res['ann_return']*100:>8.2f} "
             f"{res['max_dd']*100:>8.2f} "
-            f"{res['ic']:>8.4f} "
+            f"{res['factor_ic']:>8.4f} "
+            f"{res['strategy_ic']:>8.4f} "
             f"{res['n_trades']:>8d} "
             f"{res['win_rate']*100:>7.1f}%"
         )
