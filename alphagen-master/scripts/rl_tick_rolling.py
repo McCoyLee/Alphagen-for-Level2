@@ -4,14 +4,14 @@ Rolling-window (walk-forward) RL alpha training on 3-second bar data.
 Designed for:
   - 3-second bars (bar_size_sec=3)
   - Single ETF instrument (e.g. 510300.sh)
-  - Time range 2022-2026
+  - Time range 2023-2025
   - 20 microstructure features
-  - Walk-forward windows: 1 year train, 6 months valid, 6 months test
+  - Walk-forward windows: 6 months train, 2 months valid, 2 months test
 
 Default schedule:
-  Window 0: train 2022-01-01~2022-12-31, valid 2023-01-01~2023-06-30, test 2023-07-01~2023-12-31
-  Window 1: train 2022-07-01~2023-06-30, valid 2023-07-01~2023-12-31, test 2024-01-01~2024-06-30
-  ...rolling forward in 6-month steps...
+  Window 0: train 2023-01-01~2023-06-30, valid 2023-07-01~2023-08-31, test 2023-09-01~2023-10-31
+  Window 1: train 2023-07-01~2023-12-31, valid 2024-01-01~2024-02-29, test 2024-03-01~2024-04-30
+  ...rolling forward in 6-month steps until train 2025-01~2025-06...
 
 Each window:
   1. Loads train/valid/test data as 3s bars with 20 features
@@ -30,7 +30,7 @@ Usage:
     python scripts/rl_tick_rolling.py \\
         --data_root=~/EquityLevel2/stock \\
         --instruments='["510300.sh"]' \\
-        --train_months=12 --valid_months=6 --test_months=6 --step_months=6
+        --train_months=6 --valid_months=2 --test_months=2 --step_months=6
 """
 
 import json
@@ -369,11 +369,11 @@ class TickRollingCallback(BaseCallback):
 # ---------------------------------------------------------------------------
 
 def build_rolling_schedule(
-    global_start: str = "2022-01-01",
-    global_end: str = "2026-12-31",
-    train_months: int = 12,
-    valid_months: int = 6,
-    test_months: int = 6,
+    global_start: str = "2023-01-01",
+    global_end: str = "2025-10-31",
+    train_months: int = 6,
+    valid_months: int = 2,
+    test_months: int = 2,
     step_months: int = 6,
 ) -> List[dict]:
     """Generate walk-forward window list."""
@@ -540,8 +540,8 @@ def train_one_window(
     with open(os.path.join(window_dir, "window_meta.json"), "w") as f:
         json.dump(window, f, indent=2)
 
-    close = Feature(TickFeatureType.CLOSE)
-    target = Ref(close, -max_future_bars) / close - 1
+    mid_prc = Feature(TickFeatureType.MID)
+    target = Ref(mid_prc, -max_future_bars) / mid_prc - 1
 
     def get_dataset(start: str, end: str) -> TickStockData:
         return TickStockData(
@@ -787,15 +787,15 @@ def main(
     # Bar size
     bar_size_sec: int = 3,
     # Rolling window
-    global_start: str = "2022-01-01",
-    global_end: str = "2026-12-31",
-    train_months: int = 12,
-    valid_months: int = 6,
-    test_months: int = 6,
+    global_start: str = "2023-01-01",
+    global_end: str = "2025-10-31",
+    train_months: int = 6,
+    valid_months: int = 2,
+    test_months: int = 2,
     step_months: int = 6,
     # Lookback / forward (in bars)
     max_backtrack_bars: int = 1200,
-    max_future_bars: int = 300,
+    max_future_bars: int = 100,
     # IO
     cache_dir: Optional[str] = "./out/tick_cache",
     max_workers: int = 8,
@@ -851,7 +851,7 @@ def main(
     :param test_months: Test window in months
     :param step_months: Rolling step size in months
     :param max_backtrack_bars: Max lookback in bars (4800 ≈ 1 day)
-    :param max_future_bars: Max forward look in bars (1200 ≈ 1 hour)
+    :param max_future_bars: Max forward look in bars (100 ≈ 5 minutes)
     :param cache_dir: Cache directory
     :param max_workers: Parallel HDF5 IO threads
     :param ic_mut_threshold: Mutual IC rejection threshold
