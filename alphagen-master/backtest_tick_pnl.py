@@ -33,17 +33,18 @@ import argparse
 import sys
 import os
 import json
+from typing import List, Tuple
 import numpy as np
 import torch
 import pandas as pd
- 
+
 # ── Path setup ────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
- 
+
 from alphagen_level2.stock_data_tick import TickStockData, TickFeatureType
 from alphagen_level2.calculator_tick import TickCalculator
 from alphagen_level2.config_tick import TICK_FEATURES
-from alphagen.data.expression import Feature, Ref
+from alphagen.data.expression import Feature, Ref, Expression
 from alphagen.data.parser import ExpressionParser
 from alphagen.data.expression import *
 from alphagen_level2.config_tick import OPERATORS as TICK_OPERATORS
@@ -381,6 +382,68 @@ def calc_factor_ic(
     return ic, n_valid
 
 
+def build_ensemble_signal(
+    parser: ExpressionParser,
+    data: TickStockData,
+    factors: List[dict],
+) -> Tuple[np.ndarray, List[Expression], List[float], List[dict]]:
+    """
+    Build a training-compatible ensemble signal:
+
+        ensemble = sum_i  w_i * zscore(alpha_i.evaluate(data))
+
+    This matches `TensorAlphaCalculator.make_ensemble_alpha` +
+    `TickCalculator.evaluate_alpha` (i.e. the exact formula behind the pool
+    IC reported during training). Per-alpha z-score is REQUIRED because
+    signed weights in `final_pool.json` are learned on normalized factors;
+    summing raw expressions would let the largest-magnitude component
+    dominate by several orders of magnitude.
+
+    Returns:
+      signal:          [n_bars] numpy array, the composite factor time series
+      parsed_exprs:    list of Expression objects (filtered: only those that
+                       parsed + evaluated successfully)
+      used_weights:    list of float, aligned with parsed_exprs
+      parsed_factors:  list of original fdefs used (aligned with the above)
+    """
+    # target=None → skip target evaluation; we only need evaluate_alpha's
+    # per-alpha normalization here.
+    norm_calc = TickCalculator(data, target=None)
+
+    parts: List[torch.Tensor] = []
+    parsed_exprs: List[Expression] = []
+    used_weights: List[float] = []
+    parsed_factors: List[dict] = []
+
+    for fdef in factors:
+        name = fdef.get("name", "?")
+        expr_str = str(fdef.get("expr", "")).strip()
+        if not expr_str:
+            continue
+        try:
+            expr = parser.parse(expr_str)
+        except Exception as e:
+            print(f"  [{name}] PARSE ERROR: {e}")
+            continue
+        try:
+            z = norm_calc.evaluate_alpha(expr)   # normalized, [n_bars, 1]
+        except Exception as e:
+            print(f"  [{name}] EVAL ERROR: {e}")
+            continue
+        w = float(fdef.get("mean_w", 1.0))
+        parts.append(z * w)
+        parsed_exprs.append(expr)
+        used_weights.append(w)
+        parsed_factors.append(fdef)
+
+    if not parts:
+        return np.array([], dtype=np.float64), [], [], []
+
+    signal_t = torch.stack(parts, dim=0).sum(dim=0).squeeze(-1)   # [n_bars]
+    signal = signal_t.detach().cpu().numpy().astype(np.float64)
+    return signal, parsed_exprs, used_weights, parsed_factors
+
+
 def safe_corr(x: np.ndarray, y: np.ndarray, min_n: int = 30) -> float:
     """NaN-safe Pearson correlation with std guard (prevents numpy warnings)."""
     if x.size != y.size:
@@ -540,6 +603,28 @@ def main():
             "or stable_factor_pool.json (selected list). If unset, uses built-in FACTORS."
         ),
     )
+    ap.add_argument(
+        "--mode",
+        choices=["auto", "ensemble", "per_factor"],
+        default="auto",
+        help=(
+            "How to treat a multi-factor pool. "
+            "'ensemble': combine training-style -- sum_i w_i * zscore(alpha_i) -- "
+            "and run ONE composite signal (this is the correct way to reproduce "
+            "training pool IC). "
+            "'per_factor': evaluate each expression individually (useful to inspect "
+            "single-factor contribution but NOT comparable to training pool IC). "
+            "'auto' (default): 'ensemble' when --factors_json is given, else 'per_factor'."
+        ),
+    )
+    ap.add_argument(
+        "--per_factor_diagnostic",
+        action="store_true",
+        help=(
+            "In ensemble mode, additionally print a per-factor IC(f) diagnostic "
+            "table before running the composite."
+        ),
+    )
     args = ap.parse_args()
  
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -597,35 +682,41 @@ def main():
             print(f"No factors loaded from {args.factors_json}")
             return
 
+    # ── Resolve run mode ──────────────────────────────────────────────────
+    if args.mode == "auto":
+        run_mode = "ensemble" if args.factors_json is not None else "per_factor"
+    else:
+        run_mode = args.mode
+    print(f"Run mode: {run_mode}  (#factors={len(factors_to_eval)})")
+
     header = (
         f"{'Factor':<28} {'Dir':>4} {'Sharpe':>7} {'AnnRet%':>8} "
         f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} {'WinRate':>8}"
     )
-    print("\n" + "=" * len(header))
-    print(header)
-    print("=" * len(header))
- 
-    for fdef in factors_to_eval:
-        name = fdef["name"]
-        expr_str = fdef["expr"]
- 
-        try:
-            expr = parser.parse(expr_str)
-        except Exception as e:
-            print(f"  [{name}] PARSE ERROR: {e}")
-            continue
- 
-        try:
-            alpha_tensor = expr.evaluate(data)  # [n_bars, 1]
-        except Exception as e:
-            print(f"  [{name}] EVAL ERROR: {e}")
-            continue
- 
-        signal = alpha_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
+
+    def print_header():
+        print("\n" + "=" * len(header))
+        print(header)
+        print("=" * len(header))
+
+    def eval_one_factor_and_append(
+        name: str,
+        expr_str: str,
+        signal: np.ndarray,
+        mean_w: float,
+        expr_for_train_ic=None,
+    ) -> None:
+        """Evaluate IC(f), simulate P&L for a single signal, print a row, append."""
         signal_clean = pd.Series(signal, dtype=np.float64).ffill().fillna(0.0).to_numpy()
         if args.factor_ic_mode == "train_compatible":
             assert ic_calculator is not None
-            factor_ic = float(ic_calculator.calc_single_IC_ret(expr))
+            if expr_for_train_ic is not None:
+                factor_ic = float(ic_calculator.calc_single_IC_ret(expr_for_train_ic))
+            else:
+                # No single expression -- correlate provided signal tensor with
+                # the train-style normalized target directly.
+                tgt = ic_calculator.target.squeeze(-1).detach().cpu().numpy()
+                factor_ic = safe_corr(signal_clean, tgt, min_n=30)
             ic_n = int(data.n_days)
         else:
             factor_ic, ic_n = calc_factor_ic(
@@ -635,18 +726,17 @@ def main():
                 holding_bars=args.holding_bars,
                 execution_delay=args.execution_delay,
             )
- 
-        # ── Direction: from mean_w or auto-detect ─────────────────────
+
         if args.auto_direction:
             direction = auto_detect_direction(
-                signal, mid_prc, args.holding_bars, calibration_frac=0.2, execution_delay=args.execution_delay,
+                signal, mid_prc, args.holding_bars,
+                calibration_frac=0.2, execution_delay=args.execution_delay,
             )
             dir_label = f"auto({'+'if direction>0 else '-'})"
         else:
-            direction = np.sign(fdef["mean_w"]) if fdef["mean_w"] != 0 else 1.0
+            direction = np.sign(mean_w) if mean_w != 0 else 1.0
             dir_label = f"{'+'if direction>0 else '-'}(w)"
- 
-        # ── Simulate P&L ──────────────────────────────────────────────
+
         res = simulate_pnl(
             signal=signal,
             mid_prc=mid_prc,
@@ -663,7 +753,7 @@ def main():
         res["factor_ic"] = factor_ic
         res["factor_ic_n"] = ic_n
         all_results.append(res)
- 
+
         print(
             f"  {name:<26} {dir_label:>4} "
             f"{res['sharpe']:>7.2f} "
@@ -674,7 +764,102 @@ def main():
             f"{res['n_trades']:>8d} "
             f"{res['win_rate']*100:>7.1f}%"
         )
- 
+
+    # ── Optional per-factor diagnostic (only in ensemble mode) ────────────
+    if run_mode == "ensemble" and args.per_factor_diagnostic:
+        print("\n[diagnostic] Per-factor IC(f) (not comparable to pool IC):")
+        print("-" * len(header))
+        print(f"{'#':>3}  {'Name':<26} {'mean_w':>10} {'IC(f)':>10}")
+        print("-" * len(header))
+        for i, fdef in enumerate(factors_to_eval):
+            try:
+                expr_i = parser.parse(str(fdef["expr"]))
+            except Exception as e:
+                print(f"  {i:>3}  {fdef.get('name','?'):<26}   PARSE ERROR: {e}")
+                continue
+            try:
+                if args.factor_ic_mode == "train_compatible":
+                    assert ic_calculator is not None
+                    ic_i = float(ic_calculator.calc_single_IC_ret(expr_i))
+                else:
+                    sig_i = expr_i.evaluate(data).squeeze(-1).cpu().numpy().astype(np.float64)
+                    sig_i_clean = pd.Series(sig_i).ffill().fillna(0.0).to_numpy()
+                    ic_i, _ = calc_factor_ic(
+                        sig_i_clean, mid_prc,
+                        bars_per_day=bpd,
+                        holding_bars=args.holding_bars,
+                        execution_delay=args.execution_delay,
+                    )
+            except Exception as e:
+                print(f"  {i:>3}  {fdef.get('name','?'):<26}   EVAL ERROR: {e}")
+                continue
+            w_i = float(fdef.get("mean_w", 1.0))
+            print(f"  {i:>3}  {fdef.get('name','?'):<26} {w_i:>10.6f} {ic_i:>10.4f}")
+        print("-" * len(header))
+
+    # ── Main evaluation ───────────────────────────────────────────────────
+    print_header()
+
+    if run_mode == "ensemble":
+        signal, parsed_exprs, used_weights, parsed_factors = build_ensemble_signal(
+            parser, data, factors_to_eval,
+        )
+        if signal.size == 0:
+            print("Ensemble build failed (no valid factors).")
+            print("=" * len(header))
+            return
+
+        # Training-side pool IC (for clarity, always compute when we have the
+        # train-style calculator available).
+        if ic_calculator is not None:
+            pool_ic_train = float(
+                ic_calculator.calc_pool_IC_ret(parsed_exprs, used_weights)
+            )
+            _, _, pool_ric_train, _ = ic_calculator.calc_pool_all_ret_with_ir(
+                parsed_exprs, used_weights
+            )
+            print(
+                f"  [info] Training-compatible pool IC = {pool_ic_train:.4f}, "
+                f"pool RankIC = {pool_ric_train:.4f}  "
+                f"(built from {len(parsed_exprs)} factor(s))"
+            )
+
+        # Overall direction: +1 by convention (weights already carry signs).
+        # --auto_direction will override if requested.
+        eval_one_factor_and_append(
+            name="Ensemble(train-style)",
+            expr_str=f"<ensemble of {len(parsed_exprs)} factors>",
+            signal=signal,
+            mean_w=1.0,
+            expr_for_train_ic=None,
+        )
+
+    else:  # per_factor mode (old behavior, for hand-crafted single factors)
+        for fdef in factors_to_eval:
+            name = fdef["name"]
+            expr_str = fdef["expr"]
+
+            try:
+                expr = parser.parse(expr_str)
+            except Exception as e:
+                print(f"  [{name}] PARSE ERROR: {e}")
+                continue
+
+            try:
+                alpha_tensor = expr.evaluate(data)   # [n_bars, 1]
+            except Exception as e:
+                print(f"  [{name}] EVAL ERROR: {e}")
+                continue
+
+            signal = alpha_tensor.squeeze(-1).cpu().numpy().astype(np.float64)
+            eval_one_factor_and_append(
+                name=name,
+                expr_str=expr_str,
+                signal=signal,
+                mean_w=float(fdef.get("mean_w", 1.0)),
+                expr_for_train_ic=expr,
+            )
+
     print("=" * len(header))
  
     if not all_results:
