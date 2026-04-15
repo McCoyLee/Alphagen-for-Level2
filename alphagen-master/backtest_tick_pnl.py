@@ -50,108 +50,73 @@ from alphagen_level2.config_tick import OPERATORS as TICK_OPERATORS
  
  
 # ── Factors to backtest ───────────────────────────────────────────────────────
-FACTORS = [
+FACTORS = [ 
     {
-        "name": "High Inverse",
-        "expr": "Div(-0.5,$high)",
-        "mean_w": -0.01363,
-    },
-    {
-        "name": "Bid-Ask Volume Imbalance Ratio",
-        "expr": "Div(Sub($bid_vol1,$ask_vol1),Add($bid_vol1,$ask_vol1))",
-        "mean_w": +0.05525,
-    },
-    {
-        "name": "Imbalance1 Sum Max Scaled",
-        "expr": "Div(Sub(-2.0,Max(Sum($imbalance_1,10d),600d)),-0.01)",
-        "mean_w": -0.04476,
-    },
-    {
-        "name": "Total Ask Mean(600)",
-        "expr": "Mean($total_ask,600d)",
-        "mean_w": -0.04811,
-    },
-    {
-        "name": "Total Bid Max Inverted",
-        "expr": "Sub(-1.0,Max($total_bid,600d))",
-        "mean_w": -0.04144,
-    },
-    {
-        "name": "Spread EMA Diff",
-        "expr": "Sub(EMA($spread_pct,20d),EMA($spread_pct,600d))",
-        "mean_w": +0.01626,
-    },
-    {
-        "name": "Volume-DeltaBidVol Nonlinear Max",
-        "expr": "Max(Sub(Div(-2.0,Div(Sub($volume,-1.0),$delta_bid_vol1)),-1.0),100d)",
-        "mean_w": +0.01632,
-    },
-    {
-        "name": "Turnover Min Threshold",
-        "expr": "Greater(-2.0,Min(Min($turnover,100d),100d))",
-        "mean_w": +0.01333,
-    },
-    {
-        "name": "Return-Mid Ratio Max",
-        "expr": "Max(Div(-2.0,Sub(Med($ret,100d),$mid)),100d)",
-        "mean_w": +0.03589,
-    },
-    {
-        "name": "Turnover Threshold Max",
-        "expr": "Max(Greater(-0.5,$turnover),600d)",
-        "mean_w": +0.02086,
-    },
-    {
-        "name": "Ask-Low Condition Delta Sum",
-        "expr": "Delta(Sum(Less(Greater(-2.0,$total_ask),$low),100d),100d)",
-        "mean_w": +0.01396,
-    },
-    {
-        "name": "ImbalanceTotal Sum Scaled",
-        "expr": "Mul(-2.0,Sum($imbalance_total,100d))",
-        "mean_w": +0.03630,
-    },
-    {
-        "name": "Return Mean Negative",
-        "expr": "Mul(-1.0,Mean($ret,100d))",
-        "mean_w": -0.01768,
-    },
-    {
-        "name": "ImbalanceTotal x Return Volatility",
-        "expr": "Mul($imbalance_total,Std($ret,100d))",
-        "mean_w": -0.04739,
-    },
-    {
-        "name": "VWAP Median Threshold",
-        "expr": "Greater(-0.5,Greater(Med($vwap,100d),-1.0))",
-        "mean_w": +0.01320,
-    },
-    {
-        "name": "DeltaBidVol vs Spread Max",
-        "expr": "Add(-1.0,Max(Greater($delta_bid_vol1,$spread_pct),20d))",
-        "mean_w": +0.01371,
-    },
-    {
-        "name": "Ask vs DeltaAskVol Condition",
-        "expr": "Greater(Max(Greater(-2.0,$total_ask),100d),$delta_ask_vol1)",
-        "mean_w": -0.03462,
-    },
-    {
-        "name": "Turnover Sum Threshold",
-        "expr": "Greater(-1.0,Sum($turnover,600d))",
-        "mean_w": -0.05133,
-    },
-    {
-        "name": "DeltaBidVol Max Inverted",
-        "expr": "Sub(1.0,Max($delta_bid_vol1,600d))",
-        "mean_w": +0.02076,
-    },
-    {
-        "name": "ImbalanceTotal Threshold",
-        "expr": "Greater(-0.5,$imbalance_total)",
-        "mean_w": +0.04018,
-    },
+    "name": "CompositeFactor",
+    "expr": """
+Add(
+    Add(
+        Add(
+            Add(
+                Mul(0.0413751827, Greater(-1.0,$imbalance_1)),
+                Mul(0.0233934425, Delta(Add($spread,Add(-1.0,WMA($mid,10d))),600d))
+            ),
+            Add(
+                Mul(0.0233966197, Cov(Mul(Log($bid_vol1),$open),Sub(Add($volume,0.5),Mad($spread,10d)),100d)),
+                Mul(-0.0237909435, Add(-1.0,WMA(Corr($total_ask,Sum(Mad($close,20d),20d),10d),100d)))
+            )
+        ),
+        Add(
+            Add(
+                Mul(0.0416485553, Sum(Abs(Mul(Mul($total_ask,30.0),$ret)),20d)),
+                Mul(-0.0194934561, Sub(0.5,Sub(Cov($spread,$turnover,20d),-30.0)))
+            ),
+            Add(
+                Mul(-0.0389350430, Mean(Mul(Mul($total_ask,$vwap),30.0),600d)),
+                Mul(-0.0261391387, Add(Std($imbalance_1,100d),Add(10.0,$mid)))
+            )
+        )
+    ),
+    Add(
+        Add(
+            Add(
+                Mul(-0.0241222087, EMA(Div(Sum(Var(Sub(-10.0,$mid),20d),10d),10.0),10d)),
+                Mul(0.0267692522, Min($turnover,100d))
+            ),
+            Add(
+                Mul(0.0307991812, Min(Mul(2.0,$volume),10d)),
+                Mul(0.0369686261, Mul(5.0,Max(Mad(Mean(Abs(Mad($signed_volume,20d)),20d),10d),600d)))
+            )
+        ),
+        Add(
+            Add(
+                Mul(0.0291822423, Delta($total_bid,100d)),
+                Mul(-0.0215400183, Mad(Less(Log($volume),Mul($vwap,Sub(Greater($mid,$total_bid),Sub(0.5,$delta_bid_vol1)))),10d))
+            ),
+            Add(
+                Add(
+                    Mul(0.0445321307, Std($low,600d)),
+                    Mul(-0.0180364627, Mad(Div($signed_volume,5.0),600d))
+                ),
+                Add(
+                    Add(
+                        Mul(-0.0307488271, Less(5.0,Less(Mean($signed_volume,600d),-0.01))),
+                        Mul(0.0217087253, Div(0.5,Std($ret,1200d)))
+                    ),
+                    Add(
+                        Mul(-0.0368458658, Mean($volume,100d)),
+                        Mul(-0.0306564097, Greater(Mad($turnover,600d),$imbalance_total))
+                    )
+                )
+            )
+        )
+    )
+)
+""",
+    "mean_w": 1.0
+}
 ]
+
 
 
 def load_factors(path: str):
@@ -196,7 +161,7 @@ def load_factors(path: str):
  
 # ── Backtest parameters ───────────────────────────────────────────────────────
 DEFAULT_HOLDING_BARS = 100  # match training target: Ref(mid_prc,-100)/mid_prc-1
-COST_BPS = 5.0               # round-trip cost per trade (ETF single-side 2.5 bps)
+COST_BPS = 0.5               # round-trip cost per trade (ETF single-side 2.5 bps)
  
  
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -276,7 +241,7 @@ def simulate_pnl(
             z = np.clip(z, -3.0, 3.0) / 3.0  # normalize to [-1, 1]
             pos = z * direction
  
-            if abs(pos) < 0.5:     # dead zone: skip negligible positions
+            if abs(pos) < 0.05:     # dead zone: skip negligible positions
                 t += holding_bars
                 continue
  
