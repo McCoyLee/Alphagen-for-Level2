@@ -28,7 +28,7 @@ import fire
 from sb3_contrib.ppo_mask import MaskablePPO
 from stable_baselines3.common.callbacks import BaseCallback
 from alphagen.data.expression import *
-from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool
+from alphagen.models import linear_alpha_pool as _linear_alpha_pool
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
@@ -38,6 +38,10 @@ from alphagen_level2.env_wrapper import Level2AlphaEnv
 from alphagen_level2.config import BASIC_FEATURES, LEVEL2_FEATURES
 from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergence
 from alphagen_level2.diversity_pool import DiversityMseAlphaPool
+LinearAlphaPool = _linear_alpha_pool.LinearAlphaPool
+MseAlphaPool = _linear_alpha_pool.MseAlphaPool
+SingleFactorAlphaPool = getattr(_linear_alpha_pool, "SingleFactorAlphaPool", MseAlphaPool)
+HAS_SINGLE_FACTOR_POOL = hasattr(_linear_alpha_pool, "SingleFactorAlphaPool")
 class Level2Callback(BaseCallback):
     def __init__(
         self,
@@ -67,7 +71,10 @@ class Level2Callback(BaseCallback):
         if current_eval_cnt >= self._last_pool_eval_cnt:
             self._global_eval_cnt += (current_eval_cnt - self._last_pool_eval_cnt)
         self._last_pool_eval_cnt = current_eval_cnt
-        sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
+        if isinstance(pool, SingleFactorAlphaPool):
+            sig_count = int(pool.size)
+        else:
+            sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
         self.logger.record('pool/size', pool.size)
         self.logger.record('pool/significant', sig_count)
         self.logger.record('pool/best_ic_ret', pool.best_ic_ret)
@@ -152,6 +159,7 @@ def run_single_experiment(
     # Diversity options
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    single_factor_mode: bool = False,
 ):
     reseed_everything(seed)
     features = LEVEL2_FEATURES if use_level2_features else BASIC_FEATURES
@@ -164,6 +172,7 @@ def run_single_experiment(
     Bar size: {effective_bar_size_min:.4f} min ({effective_bar_size_min * 60:.1f} sec)
     Instruments: {instruments}
     Pool capacity: {pool_capacity}
+    Single factor mode: {single_factor_mode}
     Steps: {steps}
     Max backtrack: {max_backtrack_bars} bars ({max_backtrack_bars * effective_bar_size_min:.2f} min)
     Max future: {max_future_bars} bars ({max_future_bars * effective_bar_size_min:.2f} min)
@@ -209,9 +218,30 @@ def run_single_experiment(
         print(f"  Segment {i}: {seg[0]} ~ {seg[1]}, "
               f"{ds.n_days} bars, {ds.n_stocks} stocks, {ds.n_features} features")
     calculators = [Level2Calculator(d, target) for d in datasets]
-    # Pool: use DiversityMseAlphaPool when diversity features are requested
-    use_diversity = diversity_bonus > 0 or ic_mut_threshold < 0.99
-    if use_diversity:
+    # Pool:
+    # - single_factor_mode=True: evaluate factors independently (no linear combo objective)
+    # - otherwise keep the original combination-based pool behavior
+    use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
+    if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
+        pool = SingleFactorAlphaPool(
+            capacity=pool_capacity,
+            calculator=calculators[0],
+            ic_lower_bound=None,
+            l1_alpha=0.0,
+            device=device,
+        )
+        print("  Single-factor pool enabled: ranking by |single IC| (no combo objective)")
+    elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
+        print("  [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
+              "Falling back to combination-based pool.")
+        pool = MseAlphaPool(
+            capacity=pool_capacity,
+            calculator=calculators[0],
+            ic_lower_bound=None,
+            l1_alpha=5e-3,
+            device=device,
+        )
+    elif use_diversity:
         pool = DiversityMseAlphaPool(
             capacity=pool_capacity,
             calculator=calculators[0],
@@ -325,6 +355,7 @@ def main(
     n_envs: int = 1,
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    single_factor_mode: bool = False,
 ):
     """
     Train alpha factors using Level 2 local HDF5 data (bar-level).
@@ -343,6 +374,7 @@ def main(
     :param n_envs: Number of parallel environments (1=single, 4-8=recommended)
     :param ic_mut_threshold: Mutual IC threshold to reject correlated alphas (0.7=strict, 0.99=permissive)
     :param diversity_bonus: Reward bonus for novel alphas (0=off, 0.05-0.2=typical)
+    :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
     """
     if isinstance(random_seeds, int):
         random_seeds = (random_seeds,)
@@ -371,6 +403,7 @@ def main(
             n_envs=n_envs,
             ic_mut_threshold=ic_mut_threshold,
             diversity_bonus=diversity_bonus,
+            single_factor_mode=single_factor_mode,
         )
 if __name__ == '__main__':
     fire.Fire(main)
