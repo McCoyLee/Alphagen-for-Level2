@@ -67,7 +67,10 @@ class Level2Callback(BaseCallback):
         if current_eval_cnt >= self._last_pool_eval_cnt:
             self._global_eval_cnt += (current_eval_cnt - self._last_pool_eval_cnt)
         self._last_pool_eval_cnt = current_eval_cnt
-        sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
+        if isinstance(pool, SingleFactorAlphaPool):
+            sig_count = int(pool.size)
+        else:
+            sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
         self.logger.record('pool/size', pool.size)
         self.logger.record('pool/significant', sig_count)
         self.logger.record('pool/best_ic_ret', pool.best_ic_ret)

@@ -48,7 +48,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from alphagen.data.expression import Feature, Ref, Expression, Greater, Less, Sub
 from alphagen.data.parser import ExpressionParser
-from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool
+from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool, SingleFactorAlphaPool
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
@@ -162,7 +162,10 @@ class TickRollingCallback(BaseCallback):
             self._global_eval_cnt += current_eval_cnt - self._last_pool_eval_cnt
         self._last_pool_eval_cnt = current_eval_cnt
 
-        sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
+        if isinstance(pool, SingleFactorAlphaPool):
+            sig_count = int(pool.size)
+        else:
+            sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
         self.logger.record('pool/size', pool.size)
         self.logger.record('pool/significant', sig_count)
         self.logger.record('pool/best_ic_ret', pool.best_ic_ret)
@@ -504,6 +507,7 @@ def train_one_window(
     prev_pool_path: Optional[str] = None,
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    single_factor_mode: bool = False,
     # LLM options
     llm_warmstart: bool = False,
     use_llm: bool = False,
@@ -573,10 +577,18 @@ def train_one_window(
     calculators = [TickCalculator(d, target) for d in datasets]
 
     # Build pool
-    use_diversity = diversity_bonus > 0 or ic_mut_threshold < 0.99
+    use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
 
-    def build_pool(exprs: Optional[List[Expression]] = None) -> MseAlphaPool:
-        if use_diversity:
+    def build_pool(exprs: Optional[List[Expression]] = None) -> LinearAlphaPool:
+        if single_factor_mode:
+            p = SingleFactorAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=0.0,
+                device=device,
+            )
+        elif use_diversity:
             p = DiversityMseAlphaPool(
                 capacity=pool_capacity,
                 calculator=calculators[0],
@@ -597,6 +609,8 @@ def train_one_window(
         if exprs:
             p.force_load_exprs(exprs)
         return p
+    if single_factor_mode:
+        print(f"[Window {wid}] Single-factor pool enabled: ranking by |single IC|")
 
     pool = build_pool()
 
@@ -802,6 +816,7 @@ def main(
     # Diversity
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    single_factor_mode: bool = False,
     # LLM options
     llm_warmstart: bool = False,
     use_llm: bool = False,
@@ -856,6 +871,7 @@ def main(
     :param max_workers: Parallel HDF5 IO threads
     :param ic_mut_threshold: Mutual IC rejection threshold
     :param diversity_bonus: Reward bonus for novel alphas
+    :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
     :param llm_warmstart: Use LLM to generate initial alpha pool
     :param use_llm: Enable periodic LLM injection during RL training
     :param llm_every_n_steps: Invoke LLM every N steps
@@ -956,9 +972,10 @@ def main(
                 save_root=save_root,
                 seed=seed,
                 prev_pool_path=prev_pool_path if warm_start else None,
-                ic_mut_threshold=ic_mut_threshold,
-                diversity_bonus=diversity_bonus,
-                llm_warmstart=llm_warmstart,
+            ic_mut_threshold=ic_mut_threshold,
+            diversity_bonus=diversity_bonus,
+            single_factor_mode=single_factor_mode,
+            llm_warmstart=llm_warmstart,
                 use_llm=use_llm,
                 llm_every_n_steps=llm_every_n_steps,
                 drop_rl_n=drop_rl_n,

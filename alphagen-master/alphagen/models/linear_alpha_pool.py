@@ -346,6 +346,22 @@ class SingleFactorAlphaPool(MseAlphaPool):
         signs[signs == 0] = 1.
         return signs.astype(float)
 
+    def _calc_ics(
+        self,
+        expr: Expression,
+        ic_mut_threshold: Optional[float] = None
+    ) -> Tuple[float, Optional[List[float]]]:
+        """
+        Single-factor mode only depends on the factor's own IC.
+        Mutual-IC filtering is intentionally disabled.
+        """
+        single_ic = self.calculator.calc_single_IC_ret(expr)
+        if np.isnan(single_ic):
+            return single_ic, None
+        if self._ic_lower_bound is not None and abs(single_ic) < self._ic_lower_bound:
+            return single_ic, None
+        return single_ic, [0.0] * self.size
+
     def _best_single_index(self) -> Optional[int]:
         if self.size == 0:
             return None
@@ -373,7 +389,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
         return ic * sign, ric * sign
 
     def try_new_expr(self, expr: Expression) -> float:
-        ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=0.99)
+        ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=None)
         if ic_ret is None or ic_mut is None or np.isnan(ic_ret) or np.isnan(ic_mut).any():
             return 0.
         if str(expr) in self._failure_cache:
@@ -382,6 +398,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
         self.eval_cnt += 1
         old_pool: List[Expression] = self.exprs[:self.size]  # type: ignore
         old_ic = self.evaluate_ensemble()
+        candidate_score = float(abs(ic_ret))
         self._add_factor(expr, ic_ret, ic_mut)
         self.weights = self.optimize()
 
@@ -404,7 +421,8 @@ class SingleFactorAlphaPool(MseAlphaPool):
         self._failure_cache = set()
         new_ic_ret, new_obj = self.calculate_ic_and_objective()
         self._maybe_update_best(new_ic_ret, new_obj)
-        return new_obj
+        improvement = max(new_obj - old_ic, 0.0)
+        return candidate_score + improvement
 
 
 # Note: Currently the weights are only updated when the new IC is higher.
