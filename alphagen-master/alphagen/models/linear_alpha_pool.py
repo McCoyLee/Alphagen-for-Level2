@@ -329,6 +329,84 @@ class MseAlphaPool(LinearAlphaPool):
             return self.weights
 
 
+class SingleFactorAlphaPool(MseAlphaPool):
+    """
+    Mine standalone factors instead of linear combinations.
+
+    Behavior:
+    - Keeps a pool of factors ranked only by |single IC|.
+    - Uses +/-1 sign weights, so each factor is evaluated independently.
+    - Pool/test score is based on the best single factor in the pool.
+    """
+
+    def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:
+        if self.size == 0:
+            return np.array([])
+        signs = np.sign(self.single_ics[:self.size])
+        signs[signs == 0] = 1.
+        return signs.astype(float)
+
+    def _best_single_index(self) -> Optional[int]:
+        if self.size == 0:
+            return None
+        return int(np.argmax(np.abs(self.single_ics[:self.size])))
+
+    def _calc_main_objective(self) -> Optional[float]:
+        if self.size == 0:
+            return 0.
+        return float(np.max(np.abs(self.single_ics[:self.size])))
+
+    def evaluate_ensemble(self) -> float:
+        idx = self._best_single_index()
+        if idx is None:
+            return 0.
+        return float(abs(self.single_ics[idx]))
+
+    def test_ensemble(self, calculator: AlphaCalculator) -> Tuple[float, float]:
+        idx = self._best_single_index()
+        if idx is None:
+            return 0., 0.
+        expr = self.exprs[idx]
+        assert expr is not None
+        ic, ric = calculator.calc_single_all_ret(expr)
+        sign = 1. if self.single_ics[idx] >= 0 else -1.
+        return ic * sign, ric * sign
+
+    def try_new_expr(self, expr: Expression) -> float:
+        ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=0.99)
+        if ic_ret is None or ic_mut is None or np.isnan(ic_ret) or np.isnan(ic_mut).any():
+            return 0.
+        if str(expr) in self._failure_cache:
+            return self.best_obj
+
+        self.eval_cnt += 1
+        old_pool: List[Expression] = self.exprs[:self.size]  # type: ignore
+        old_ic = self.evaluate_ensemble()
+        self._add_factor(expr, ic_ret, ic_mut)
+        self.weights = self.optimize()
+
+        removed_idx: List[int] = []
+        if self.size > self.capacity:
+            keep = np.argsort(-np.abs(self.single_ics[:self.size]))[:self.capacity]
+            keep_set = set(keep.tolist())
+            removed_idx = sorted(i for i in range(self.size) if i not in keep_set)
+            self.leave_only(keep.tolist())
+            self.weights = self.optimize()
+
+        self.update_history.append(AddRemoveAlphas(
+            added_exprs=[expr],
+            removed_idx=removed_idx,
+            old_pool=old_pool,
+            old_pool_ic=old_ic,
+            new_pool_ic=self.evaluate_ensemble()
+        ))
+
+        self._failure_cache = set()
+        new_ic_ret, new_obj = self.calculate_ic_and_objective()
+        self._maybe_update_best(new_ic_ret, new_obj)
+        return new_obj
+
+
 # Note: Currently the weights are only updated when the new IC is higher.
 # It might be better to update the weights according to the actual objective,
 # in this case the ICIR or the LCB of the IC.
