@@ -40,7 +40,7 @@ from stable_baselines3.common.callbacks import BaseCallback
  
 from alphagen.data.expression import *
 from alphagen.data.parser import ExpressionParser
-from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool
+from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool, SingleFactorAlphaPool
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
@@ -185,7 +185,10 @@ class Level2LLMCallback(BaseCallback):
             self._global_eval_cnt += (current_eval_cnt - self._last_pool_eval_cnt)
         # If eval counter drops due rollback/reset, do not decrease global counter.
         self._last_pool_eval_cnt = current_eval_cnt
-        sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
+        if isinstance(pool, SingleFactorAlphaPool):
+            sig_count = int(pool.size)
+        else:
+            sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
  
         # Compute train ensemble IC
         train_ic = pool.best_ic_ret
@@ -451,6 +454,7 @@ def run_single_experiment(
     # Diversity options
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    single_factor_mode: bool = False,
     # Convergence plot
     plot_interval: int = 10,
     # Validation rollback controls
@@ -493,6 +497,7 @@ def run_single_experiment(
     N envs: {n_envs}
     IC mut threshold: {ic_mut_threshold}
     Diversity bonus: {diversity_bonus}
+    Single factor mode: {single_factor_mode}
     LLM warm start: {llm_warmstart or use_llm}
     LLM periodic assist: {use_llm}
     LLM invoke every: {llm_every_n_steps} steps
@@ -549,9 +554,17 @@ def run_single_experiment(
     calculators = [Level2Calculator(d, target) for d in datasets]
  
     # --- Pool factory (needed for LLM interaction) ---
-    use_diversity = diversity_bonus > 0 or ic_mut_threshold < 0.99
-    def build_pool(exprs: Optional[List[Expression]] = None) -> MseAlphaPool:
-        if use_diversity:
+    use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
+    def build_pool(exprs: Optional[List[Expression]] = None) -> LinearAlphaPool:
+        if single_factor_mode:
+            pool = SingleFactorAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=0.0,
+                device=device,
+            )
+        elif use_diversity:
             pool = DiversityMseAlphaPool(
                 capacity=pool_capacity,
                 calculator=calculators[0],
@@ -572,7 +585,9 @@ def run_single_experiment(
         if exprs:
             pool.force_load_exprs(exprs)
         return pool
-    if use_diversity:
+    if single_factor_mode:
+        print("  Single-factor pool enabled: ranking by |single IC| (no combo objective)")
+    elif use_diversity:
         print(f"  Diversity pool: ic_mut_threshold={ic_mut_threshold}, bonus={diversity_bonus}")
  
     # --- LLM setup ---
@@ -725,6 +740,7 @@ def main(
     # Diversity options
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
+    single_factor_mode: bool = False,
     # Data split
     train_start: str = "2023-03-01",
     train_end: str = "2023-06-30",
@@ -765,6 +781,7 @@ def main(
     :param n_envs: Number of parallel environments (1=single, 4-8=recommended)
     :param ic_mut_threshold: Mutual IC threshold to reject correlated alphas (0.7=strict, 0.99=permissive)
     :param diversity_bonus: Reward bonus for novel alphas (0=off, 0.05-0.2=typical)
+    :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
     :param bar_size_sec: Bar size in seconds; if set, overrides bar_size_min
     :param plot_interval: Save convergence plot every N rollout ends
     :param valid_patience: Rollouts without validation improvement before rollback
@@ -812,6 +829,7 @@ def main(
             n_envs=n_envs,
             ic_mut_threshold=ic_mut_threshold,
             diversity_bonus=diversity_bonus,
+            single_factor_mode=single_factor_mode,
             plot_interval=plot_interval,
             valid_patience=valid_patience,
             valid_min_delta=valid_min_delta,
