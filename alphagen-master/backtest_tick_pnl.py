@@ -162,7 +162,7 @@ def load_factors(path: str):
  
 # ── Backtest parameters ───────────────────────────────────────────────────────
 DEFAULT_HOLDING_BARS = 100  # match training target: Ref(mid_prc,-100)/mid_prc-1
-COST_BPS = 0.5               # round-trip cost per trade (ETF single-side 2.5 bps)
+COST_BPS = 0               # round-trip cost per trade (ETF single-side 2.5 bps)
  
  
 # ── Parser ────────────────────────────────────────────────────────────────────
@@ -569,7 +569,7 @@ def main():
     ap.add_argument("--data_root", default="/root/data/subset_data")
     ap.add_argument("--instrument", default="159845.sz")
     ap.add_argument("--start", default="2025-1-01")
-    ap.add_argument("--end", default="2025-6-30")
+    ap.add_argument("--end", default="2026-2-28")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default="tick_pnl_backtest.png")
     ap.add_argument("--holding_bars", type=int, default=DEFAULT_HOLDING_BARS,
