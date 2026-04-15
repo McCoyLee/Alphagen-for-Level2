@@ -48,7 +48,11 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from alphagen.data.expression import Feature, Ref, Expression, Greater, Less, Sub
 from alphagen.data.parser import ExpressionParser
-from alphagen.models.linear_alpha_pool import LinearAlphaPool, MseAlphaPool, SingleFactorAlphaPool
+from alphagen.models import linear_alpha_pool as _linear_alpha_pool
+LinearAlphaPool = _linear_alpha_pool.LinearAlphaPool
+MseAlphaPool = _linear_alpha_pool.MseAlphaPool
+SingleFactorAlphaPool = getattr(_linear_alpha_pool, "SingleFactorAlphaPool", MseAlphaPool)
+HAS_SINGLE_FACTOR_POOL = hasattr(_linear_alpha_pool, "SingleFactorAlphaPool")
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
@@ -580,12 +584,20 @@ def train_one_window(
     use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
 
     def build_pool(exprs: Optional[List[Expression]] = None) -> LinearAlphaPool:
-        if single_factor_mode:
+        if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
             p = SingleFactorAlphaPool(
                 capacity=pool_capacity,
                 calculator=calculators[0],
                 ic_lower_bound=None,
                 l1_alpha=0.0,
+                device=device,
+            )
+        elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
+            p = MseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
                 device=device,
             )
         elif use_diversity:
@@ -609,8 +621,10 @@ def train_one_window(
         if exprs:
             p.force_load_exprs(exprs)
         return p
-    if single_factor_mode:
+    if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] Single-factor pool enabled: ranking by |single IC|")
+    elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
+        print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` unavailable; fallback to combination pool.")
 
     pool = build_pool()
 
