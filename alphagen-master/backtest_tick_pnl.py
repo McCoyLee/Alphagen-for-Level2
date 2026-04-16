@@ -568,7 +568,7 @@ def main():
     ap = argparse.ArgumentParser(description="Tick-level P&L backtest for stable factors")
     ap.add_argument("--data_root", default="/root/data/subset_data")
     ap.add_argument("--instrument", default="159845.sz")
-    ap.add_argument("--start", default="2025-1-01")
+    ap.add_argument("--start", default="2024-1-01")
     ap.add_argument("--end", default="2026-2-28")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out", default="tick_pnl_backtest.png")
