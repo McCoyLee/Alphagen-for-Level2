@@ -51,8 +51,7 @@ from alphagen.data.parser import ExpressionParser
 from alphagen.models import linear_alpha_pool as _linear_alpha_pool
 LinearAlphaPool = _linear_alpha_pool.LinearAlphaPool
 MseAlphaPool = _linear_alpha_pool.MseAlphaPool
-SingleFactorAlphaPool = getattr(_linear_alpha_pool, "SingleFactorAlphaPool", MseAlphaPool)
-HAS_SINGLE_FACTOR_POOL = hasattr(_linear_alpha_pool, "SingleFactorAlphaPool")
+SingleFactorAlphaPool = _linear_alpha_pool.SingleFactorAlphaPool
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
@@ -512,6 +511,13 @@ def train_one_window(
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
     single_factor_mode: bool = False,
+    # Composite-reward knobs (SingleFactorAlphaPool)
+    sf_ic_weight: float = 0.5,
+    sf_profit_weight: float = 0.5,
+    sf_use_rank_ic: bool = False,
+    sf_window_days: int = 20,
+    sf_turnover_penalty: float = 0.001,
+    sf_ic_std_penalty: float = 0.0,
     # LLM options
     llm_warmstart: bool = False,
     use_llm: bool = False,
@@ -583,22 +589,24 @@ def train_one_window(
     # Build pool
     use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
 
+    _bars_per_day = datasets[0].bars_per_day
+
     def build_pool(exprs: Optional[List[Expression]] = None) -> LinearAlphaPool:
-        if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
+        if single_factor_mode:
             p = SingleFactorAlphaPool(
                 capacity=pool_capacity,
                 calculator=calculators[0],
                 ic_lower_bound=None,
                 l1_alpha=0.0,
                 device=device,
-            )
-        elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
-            p = MseAlphaPool(
-                capacity=pool_capacity,
-                calculator=calculators[0],
-                ic_lower_bound=None,
-                l1_alpha=5e-3,
-                device=device,
+                holding_bars=max_future_bars,
+                bars_per_day=_bars_per_day,
+                window_days=sf_window_days,
+                ic_weight=sf_ic_weight,
+                profit_weight=sf_profit_weight,
+                use_rank_ic=sf_use_rank_ic,
+                turnover_penalty=sf_turnover_penalty,
+                ic_std_penalty=sf_ic_std_penalty,
             )
         elif use_diversity:
             p = DiversityMseAlphaPool(
@@ -621,10 +629,10 @@ def train_one_window(
         if exprs:
             p.force_load_exprs(exprs)
         return p
-    if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
-        print(f"[Window {wid}] Single-factor pool enabled: ranking by |single IC|")
-    elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
-        print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` unavailable; fallback to combination pool.")
+    if single_factor_mode:
+        print(f"[Window {wid}] Single-factor composite-reward pool: "
+              f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
+              f"rank_ic={sf_use_rank_ic}, window={sf_window_days}d")
 
     pool = build_pool()
 
@@ -831,6 +839,13 @@ def main(
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
     single_factor_mode: bool = False,
+    # Composite-reward knobs (SingleFactorAlphaPool)
+    sf_ic_weight: float = 0.5,
+    sf_profit_weight: float = 0.5,
+    sf_use_rank_ic: bool = False,
+    sf_window_days: int = 20,
+    sf_turnover_penalty: float = 0.001,
+    sf_ic_std_penalty: float = 0.0,
     # LLM options
     llm_warmstart: bool = False,
     use_llm: bool = False,
@@ -948,6 +963,10 @@ def main(
         "steps_per_window": steps_per_window, "bar_size_sec": bar_size_sec,
         "use_all_features": use_all_features, "n_features": len(features),
         "max_backtrack_bars": max_backtrack_bars, "max_future_bars": max_future_bars,
+        "single_factor_mode": single_factor_mode,
+        "sf_ic_weight": sf_ic_weight, "sf_profit_weight": sf_profit_weight,
+        "sf_use_rank_ic": sf_use_rank_ic, "sf_window_days": sf_window_days,
+        "sf_turnover_penalty": sf_turnover_penalty, "sf_ic_std_penalty": sf_ic_std_penalty,
         "llm_warmstart": llm_warmstart, "use_llm": use_llm,
         "llm_every_n_steps": llm_every_n_steps, "drop_rl_n": drop_rl_n,
         "llm_replace_n": llm_replace_n, "n_envs": n_envs,
@@ -986,10 +1005,16 @@ def main(
                 save_root=save_root,
                 seed=seed,
                 prev_pool_path=prev_pool_path if warm_start else None,
-            ic_mut_threshold=ic_mut_threshold,
-            diversity_bonus=diversity_bonus,
-            single_factor_mode=single_factor_mode,
-            llm_warmstart=llm_warmstart,
+                ic_mut_threshold=ic_mut_threshold,
+                diversity_bonus=diversity_bonus,
+                single_factor_mode=single_factor_mode,
+                sf_ic_weight=sf_ic_weight,
+                sf_profit_weight=sf_profit_weight,
+                sf_use_rank_ic=sf_use_rank_ic,
+                sf_window_days=sf_window_days,
+                sf_turnover_penalty=sf_turnover_penalty,
+                sf_ic_std_penalty=sf_ic_std_penalty,
+                llm_warmstart=llm_warmstart,
                 use_llm=use_llm,
                 llm_every_n_steps=llm_every_n_steps,
                 drop_rl_n=drop_rl_n,
