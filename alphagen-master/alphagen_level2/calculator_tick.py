@@ -24,14 +24,16 @@ class TickCalculator(TensorAlphaCalculator):
         self.data = data
         self._single_instrument = data.n_stocks == 1
         target_tensor = None
+        raw_target_tensor = None
         if target is not None:
-            raw_target = target.evaluate(data)
+            raw_target_tensor = target.evaluate(data)
             target_tensor = (
-                self._normalize_single(raw_target)
-                if self._single_instrument else normalize_by_day(raw_target)
+                self._normalize_single(raw_target_tensor)
+                if self._single_instrument else normalize_by_day(raw_target_tensor)
             )
         super().__init__(
-            target_tensor
+            target_tensor,
+            raw_target=raw_target_tensor,
         )
 
     def evaluate_alpha(self, expr: Expression) -> Tensor:

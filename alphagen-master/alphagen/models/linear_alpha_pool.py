@@ -330,31 +330,88 @@ class MseAlphaPool(LinearAlphaPool):
 
 
 class SingleFactorAlphaPool(MseAlphaPool):
-    """
-    Mine standalone factors instead of linear combinations.
+    """Mine standalone factors with a *composite* reward.
 
-    Behavior:
-    - Keeps a pool of factors ranked only by |single IC|.
-    - Uses +/-1 sign weights, so each factor is evaluated independently.
-    - Pool/test score is based on the best single factor in the pool.
+    ``reward = ic_weight * ts_ic_score + profit_weight * normalised_profit``
+
+    where *ts_ic_score* is the windowed time-series IC (with optional
+    cross-window std penalty) and *normalised_profit* is the simplified
+    P&L metric ``R = mean(pos·r) − λ·mean(|Δpos|)`` divided by ``std(r)``.
+
+    Key differences from the combination pool:
+    - Factors are ranked independently (no linear-combination objective).
+    - Weights are ±1 signs only (direction, not magnitude).
+    - Pool / test score is based on the best single factor in the pool.
     """
 
-    def optimize(self, lr: float = 5e-4, max_steps: int = 10000, tolerance: int = 500) -> np.ndarray:
+    def __init__(
+        self,
+        capacity: int,
+        calculator: AlphaCalculator,
+        ic_lower_bound: Optional[float] = None,
+        l1_alpha: float = 0.0,
+        device: torch.device = torch.device("cpu"),
+        # ---- composite-reward knobs ----
+        holding_bars: int = 100,
+        bars_per_day: int = 4800,
+        window_days: int = 20,
+        ic_weight: float = 0.5,
+        profit_weight: float = 0.5,
+        use_rank_ic: bool = False,
+        turnover_penalty: float = 0.001,
+        ic_std_penalty: float = 0.0,
+    ):
+        super().__init__(capacity, calculator, ic_lower_bound, l1_alpha, device)
+        self.holding_bars = holding_bars
+        self.bars_per_day = bars_per_day
+        self.window_days = window_days
+        self.ic_weight = ic_weight
+        self.profit_weight = profit_weight
+        self.use_rank_ic = use_rank_ic
+        self.turnover_penalty = turnover_penalty
+        self.ic_std_penalty = ic_std_penalty
+        # _composite_scores mirrors single_ics but stores the composite score
+        self._composite_scores: np.ndarray = np.zeros(capacity + 1)
+        # _factor_directions: +1 / -1 per factor (IC sign)
+        self._factor_directions: np.ndarray = np.ones(capacity + 1)
+
+    # ---- scoring helpers ------------------------------------------------
+
+    def _score_expr(self, expr: Expression) -> Tuple[float, float, float, float]:
+        """Return (composite, ts_ic_mean, profit_norm, direction)."""
+        ts_ic_mean, ts_ic_std = self.calculator.calc_single_ts_IC_ret(
+            expr,
+            bars_per_day=self.bars_per_day,
+            window_days=self.window_days,
+            use_rank=self.use_rank_ic,
+        )
+        profit_raw = self.calculator.calc_single_profit(
+            expr,
+            holding_bars=self.holding_bars,
+            turnover_penalty=self.turnover_penalty,
+        )
+        direction = 1.0 if ts_ic_mean >= 0 else -1.0
+        ic_score = abs(ts_ic_mean) - self.ic_std_penalty * ts_ic_std
+        profit_directed = profit_raw * direction
+        composite = (
+            self.ic_weight * max(ic_score, 0.0)
+            + self.profit_weight * max(profit_directed, 0.0)
+        )
+        return composite, ts_ic_mean, profit_raw, direction
+
+    # ---- overrides ------------------------------------------------------
+
+    def optimize(self, lr=5e-4, max_steps=10000, tolerance=500) -> np.ndarray:
         if self.size == 0:
             return np.array([])
-        signs = np.sign(self.single_ics[:self.size])
-        signs[signs == 0] = 1.
-        return signs.astype(float)
+        return self._factor_directions[:self.size].copy()
 
     def _calc_ics(
         self,
         expr: Expression,
-        ic_mut_threshold: Optional[float] = None
+        ic_mut_threshold: Optional[float] = None,
     ) -> Tuple[float, Optional[List[float]]]:
-        """
-        Single-factor mode only depends on the factor's own IC.
-        Mutual-IC filtering is intentionally disabled.
-        """
+        """Bypass mutual-IC; use global IC only for lower-bound filtering."""
         single_ic = self.calculator.calc_single_IC_ret(expr)
         if np.isnan(single_ic):
             return single_ic, None
@@ -365,46 +422,71 @@ class SingleFactorAlphaPool(MseAlphaPool):
     def _best_single_index(self) -> Optional[int]:
         if self.size == 0:
             return None
-        return int(np.argmax(np.abs(self.single_ics[:self.size])))
+        return int(np.argmax(self._composite_scores[:self.size]))
 
     def _calc_main_objective(self) -> Optional[float]:
         if self.size == 0:
-            return 0.
-        return float(np.max(np.abs(self.single_ics[:self.size])))
+            return 0.0
+        return float(np.max(self._composite_scores[:self.size]))
 
     def evaluate_ensemble(self) -> float:
         idx = self._best_single_index()
         if idx is None:
-            return 0.
-        return float(abs(self.single_ics[idx]))
+            return 0.0
+        return float(self._composite_scores[idx])
 
     def test_ensemble(self, calculator: AlphaCalculator) -> Tuple[float, float]:
         idx = self._best_single_index()
         if idx is None:
-            return 0., 0.
+            return 0.0, 0.0
         expr = self.exprs[idx]
         assert expr is not None
         ic, ric = calculator.calc_single_all_ret(expr)
-        sign = 1. if self.single_ics[idx] >= 0 else -1.
-        return ic * sign, ric * sign
+        d = self._factor_directions[idx]
+        return ic * d, ric * d
+
+    def _get_extra_info(self, expr: Expression):
+        """Cache nothing; direction is stored in _factor_directions."""
+        return None
+
+    def _swap_idx(self, i: int, j: int) -> None:
+        super()._swap_idx(i, j)
+        self._composite_scores[i], self._composite_scores[j] = (
+            self._composite_scores[j], self._composite_scores[i],
+        )
+        self._factor_directions[i], self._factor_directions[j] = (
+            self._factor_directions[j], self._factor_directions[i],
+        )
+
+    # ---- main entry point -----------------------------------------------
 
     def try_new_expr(self, expr: Expression) -> float:
+        # Quick IC filter (cheap)
         ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=None)
-        if ic_ret is None or ic_mut is None or np.isnan(ic_ret) or np.isnan(ic_mut).any():
-            return 0.
+        if ic_ret is None or ic_mut is None or np.isnan(ic_ret):
+            return 0.0
         if str(expr) in self._failure_cache:
             return self.best_obj
 
         self.eval_cnt += 1
+
+        # Compute composite score (expensive)
+        composite, ts_ic, profit, direction = self._score_expr(expr)
+
         old_pool: List[Expression] = self.exprs[:self.size]  # type: ignore
-        old_ic = self.evaluate_ensemble()
-        candidate_score = float(abs(ic_ret))
-        self._add_factor(expr, ic_ret, ic_mut)
+        old_obj = self.evaluate_ensemble()
+
+        # Store composite score & direction, then add to pool
+        n = self.size
+        self._composite_scores[n] = composite
+        self._factor_directions[n] = direction
+        self._add_factor(expr, ic_ret, ic_mut)      # increments self.size
         self.weights = self.optimize()
 
+        # Prune weakest if over capacity (keep top-K by composite score)
         removed_idx: List[int] = []
         if self.size > self.capacity:
-            keep = np.argsort(-np.abs(self.single_ics[:self.size]))[:self.capacity]
+            keep = np.argsort(-self._composite_scores[:self.size])[:self.capacity]
             keep_set = set(keep.tolist())
             removed_idx = sorted(i for i in range(self.size) if i not in keep_set)
             self.leave_only(keep.tolist())
@@ -414,15 +496,15 @@ class SingleFactorAlphaPool(MseAlphaPool):
             added_exprs=[expr],
             removed_idx=removed_idx,
             old_pool=old_pool,
-            old_pool_ic=old_ic,
-            new_pool_ic=self.evaluate_ensemble()
+            old_pool_ic=old_obj,
+            new_pool_ic=self.evaluate_ensemble(),
         ))
 
         self._failure_cache = set()
         new_ic_ret, new_obj = self.calculate_ic_and_objective()
         self._maybe_update_best(new_ic_ret, new_obj)
-        improvement = max(new_obj - old_ic, 0.0)
-        return candidate_score + improvement
+        improvement = max(new_obj - old_obj, 0.0)
+        return composite + improvement
 
 
 # Note: Currently the weights are only updated when the new IC is higher.

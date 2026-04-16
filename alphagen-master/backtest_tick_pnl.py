@@ -324,7 +324,8 @@ def simulate_pnl(
  
     trade_pnls = np.array([t["pnl"] for t in trades if not np.isnan(t["pnl"])])
     win_rate = (trade_pnls > 0).mean() if len(trade_pnls) > 0 else float("nan")
- 
+    avg_profit_per_trade = float(trade_pnls.mean()) if len(trade_pnls) > 0 else float("nan")
+
     # ── Strategy IC: correlation of executed position with realized return ─
     # NOTE: This is a strategy-level metric (contains direction + sizing),
     # not pure factor IC.
@@ -332,7 +333,7 @@ def simulate_pnl(
     returns = np.array([t["ret"] for t in trades])
     valid = ~np.isnan(positions) & ~np.isnan(returns) & (positions != 0)
     strategy_ic = safe_corr(positions[valid], returns[valid], min_n=10)
- 
+
     return {
         "trades": trades,
         "daily_pnl": daily_pnl,
@@ -344,6 +345,7 @@ def simulate_pnl(
         "n_trades": len(trades),
         "n_full_days": len(daily_pnl),
         "win_rate": win_rate,
+        "avg_profit_per_trade": avg_profit_per_trade,
     }
 
 
@@ -525,6 +527,7 @@ def plot_results(
             days, 0, r["cum_pnl"] * 100,
             where=r["cum_pnl"] < 0, alpha=0.15, color="red",
         )
+        avg_ppt = r.get('avg_profit_per_trade', float('nan'))
         title = (
             f"{r['name']}  |  "
             f"Sharpe: {r['sharpe']:.2f}  |  "
@@ -532,7 +535,8 @@ def plot_results(
             f"MaxDD: {r['max_dd']*100:.1f}%  |  "
             f"IC(f): {r['factor_ic']:.4f}  |  "
             f"IC(s): {r.get('strategy_ic', float('nan')):.4f}  |  "
-            f"Trades: {r['n_trades']}  WinRate: {r['win_rate']*100:.0f}%"
+            f"Trades: {r['n_trades']}  WinRate: {r['win_rate']*100:.0f}%  "
+            f"AvgPPT: {avg_ppt*1e4:.2f}bps"
         )
         ax.set_title(title, fontsize=9)
         ax.set_ylabel("Cum. Return (%)")
@@ -691,7 +695,8 @@ def main():
 
     header = (
         f"{'Factor':<28} {'Dir':>4} {'Sharpe':>7} {'AnnRet%':>8} "
-        f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} {'WinRate':>8}"
+        f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} "
+        f"{'WinRate':>8} {'AvgPPT':>10}"
     )
 
     def print_header():
@@ -754,6 +759,7 @@ def main():
         res["factor_ic_n"] = ic_n
         all_results.append(res)
 
+        avg_ppt = res.get('avg_profit_per_trade', float('nan'))
         print(
             f"  {name:<26} {dir_label:>4} "
             f"{res['sharpe']:>7.2f} "
@@ -762,7 +768,8 @@ def main():
             f"{res['factor_ic']:>8.4f} "
             f"{res.get('strategy_ic', float('nan')):>8.4f} "
             f"{res['n_trades']:>8d} "
-            f"{res['win_rate']*100:>7.1f}%"
+            f"{res['win_rate']*100:>7.1f}% "
+            f"{avg_ppt*1e4:>9.2f}bps"
         )
 
     # ── Optional per-factor diagnostic (only in ensemble mode) ────────────

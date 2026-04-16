@@ -8,7 +8,9 @@ from alphagen_qlib.stock_data import StockData
 
 class QLibStockDataCalculator(TensorAlphaCalculator):
     def __init__(self, data: StockData, target: Optional[Expression] = None):
-        super().__init__(normalize_by_day(target.evaluate(data)) if target is not None else None)
+        raw = target.evaluate(data) if target is not None else None
+        normed = normalize_by_day(raw) if raw is not None else None
+        super().__init__(normed, raw_target=raw)
         self.data = data
 
     def evaluate_alpha(self, expr: Expression) -> Tensor:

@@ -40,8 +40,7 @@ from alphagen_level2.convergence_logger import ConvergenceLogger, plot_convergen
 from alphagen_level2.diversity_pool import DiversityMseAlphaPool
 LinearAlphaPool = _linear_alpha_pool.LinearAlphaPool
 MseAlphaPool = _linear_alpha_pool.MseAlphaPool
-SingleFactorAlphaPool = getattr(_linear_alpha_pool, "SingleFactorAlphaPool", MseAlphaPool)
-HAS_SINGLE_FACTOR_POOL = hasattr(_linear_alpha_pool, "SingleFactorAlphaPool")
+SingleFactorAlphaPool = _linear_alpha_pool.SingleFactorAlphaPool
 class Level2Callback(BaseCallback):
     def __init__(
         self,
@@ -222,25 +221,17 @@ def run_single_experiment(
     # - single_factor_mode=True: evaluate factors independently (no linear combo objective)
     # - otherwise keep the original combination-based pool behavior
     use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
-    if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
+    if single_factor_mode:
         pool = SingleFactorAlphaPool(
             capacity=pool_capacity,
             calculator=calculators[0],
             ic_lower_bound=None,
             l1_alpha=0.0,
             device=device,
+            holding_bars=max_future_bars,
+            bars_per_day=datasets[0].bars_per_day if hasattr(datasets[0], "bars_per_day") else 1,
         )
-        print("  Single-factor pool enabled: ranking by |single IC| (no combo objective)")
-    elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
-        print("  [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
-              "Falling back to combination-based pool.")
-        pool = MseAlphaPool(
-            capacity=pool_capacity,
-            calculator=calculators[0],
-            ic_lower_bound=None,
-            l1_alpha=5e-3,
-            device=device,
-        )
+        print("  Single-factor composite-reward pool enabled")
     elif use_diversity:
         pool = DiversityMseAlphaPool(
             capacity=pool_capacity,
