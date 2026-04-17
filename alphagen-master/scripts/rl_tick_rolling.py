@@ -593,7 +593,8 @@ def train_one_window(
     _bars_per_day = datasets[0].bars_per_day
 
     def build_pool(exprs: Optional[List[Expression]] = None) -> LinearAlphaPool:
-        if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
+        if single_factor_mode:
+            print(f"[build_pool] Creating SingleFactorAlphaPool (type={SingleFactorAlphaPool.__name__})")
             p = SingleFactorAlphaPool(
                 capacity=pool_capacity,
                 calculator=calculators[0],
@@ -647,6 +648,12 @@ def train_one_window(
               f"Falling back to MseAlphaPool.")
 
     pool = build_pool()
+    if single_factor_mode:
+        assert isinstance(pool, SingleFactorAlphaPool), \
+            f"BUG: pool is {type(pool).__name__}, expected SingleFactorAlphaPool"
+        print(f"[Window {wid}] Pool type confirmed: {type(pool).__name__}")
+        print(f"  optimize() owner: {type(pool).optimize}")
+        print(f"  to_json_dict owner: {type(pool).to_json_dict}")
 
     # Warm-start from previous window's pool
     if prev_pool_path is not None and os.path.exists(prev_pool_path):
@@ -789,8 +796,18 @@ def train_one_window(
 
     # Save final pool
     final_pool_path = os.path.join(window_dir, "final_pool.json")
+    pool_dict = pool.to_json_dict()
+    if single_factor_mode:
+        bad = [w for w in pool_dict["weights"] if abs(abs(w) - 1.0) > 1e-6]
+        if bad:
+            print(f"[BUG] Final pool has non-±1 weights: {pool_dict['weights']}")
+            print(f"  pool type: {type(pool).__name__}")
+            print(f"  _factor_directions: {list(pool._factor_directions[:pool.size])}")
+            print(f"  raw _weights: {list(pool._weights[:pool.size])}")
+        else:
+            print(f"[Window {wid}] Final pool weights OK (all ±1): {pool_dict['weights']}")
     with open(final_pool_path, "w") as f:
-        json.dump(pool.to_json_dict(), f)
+        json.dump(pool_dict, f)
 
     csv_path = conv_logger.save_csv()
     conv_logger.save_json()
