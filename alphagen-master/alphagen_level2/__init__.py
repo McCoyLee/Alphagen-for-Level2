@@ -1,4 +1,4 @@
-from alphagen_level2.stock_data import Level2StockData, Level2FeatureType
+from alphagen_level2.stock_data_tick import TickStockData, TickFeatureType
 from alphagen_level2.hdf5_reader import Level2HDF5Reader
-from alphagen_level2.calculator import Level2Calculator
-from alphagen_level2.env_wrapper import Level2AlphaEnv
+from alphagen_level2.calculator_tick import TickCalculator
+from alphagen_level2.env_wrapper_tick import TickAlphaEnv
