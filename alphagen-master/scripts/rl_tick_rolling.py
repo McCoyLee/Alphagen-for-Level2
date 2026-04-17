@@ -51,7 +51,8 @@ from alphagen.data.parser import ExpressionParser
 from alphagen.models import linear_alpha_pool as _linear_alpha_pool
 LinearAlphaPool = _linear_alpha_pool.LinearAlphaPool
 MseAlphaPool = _linear_alpha_pool.MseAlphaPool
-SingleFactorAlphaPool = _linear_alpha_pool.SingleFactorAlphaPool
+SingleFactorAlphaPool = getattr(_linear_alpha_pool, "SingleFactorAlphaPool", MseAlphaPool)
+HAS_SINGLE_FACTOR_POOL = hasattr(_linear_alpha_pool, "SingleFactorAlphaPool")
 from alphagen.rl.policy import LSTMSharedNet
 from alphagen.utils import reseed_everything, get_logger
 from alphagen.rl.env.core import AlphaEnvCore
@@ -165,7 +166,7 @@ class TickRollingCallback(BaseCallback):
             self._global_eval_cnt += current_eval_cnt - self._last_pool_eval_cnt
         self._last_pool_eval_cnt = current_eval_cnt
 
-        if isinstance(pool, SingleFactorAlphaPool):
+        if HAS_SINGLE_FACTOR_POOL and isinstance(pool, SingleFactorAlphaPool):
             sig_count = int(pool.size)
         else:
             sig_count = int((np.abs(pool.weights[:pool.size]) > 1e-4).sum())
@@ -609,6 +610,14 @@ def train_one_window(
                 turnover_penalty=sf_turnover_penalty,
                 ic_std_penalty=sf_ic_std_penalty,
             )
+        elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
+            p = MseAlphaPool(
+                capacity=pool_capacity,
+                calculator=calculators[0],
+                ic_lower_bound=None,
+                l1_alpha=5e-3,
+                device=device,
+            )
         elif use_diversity:
             p = DiversityMseAlphaPool(
                 capacity=pool_capacity,
@@ -630,10 +639,13 @@ def train_one_window(
         if exprs:
             p.force_load_exprs(exprs)
         return p
-    if single_factor_mode:
+    if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] Single-factor composite-reward pool: "
               f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
               f"rank_ic={sf_use_rank_ic}, window={sf_window_days}d")
+    elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
+        print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
+              f"Falling back to MseAlphaPool.")
 
     pool = build_pool()
     if single_factor_mode:
@@ -833,7 +845,7 @@ def train_one_window(
 def main(
     seed: int = 0,
     instruments: Union[str, List[str]] = '["510300.sh"]',
-    pool_capacity: int = 20,
+    pool_capacity: int = 10,
     steps_per_window: int = 150_000,
     data_root: str = "~/EquityLevel2/stock",
     use_all_features: bool = True,
@@ -867,14 +879,14 @@ def main(
     llm_warmstart: bool = False,
     use_llm: bool = False,
     llm_every_n_steps: int = 25_000,
-    drop_rl_n: int = 5,
-    llm_replace_n: int = 3,
+    drop_rl_n: int = 3,
+    llm_replace_n: int = 2,
     llm_base_url: str = "http://10.2.1.205:8796/v1",
     llm_api_key: str = "sk-GEmM5YHREocL6mOOVEOUQ0Rs0qgWoB_KjJ-fSZUYd30",
     llm_model: str = "MiniMax-M2.5",
     gentle_inject: bool = True,
-    llm_init_min_pool_size: int = 5,
-    llm_init_updates: int = 4,
+    llm_init_min_pool_size: int = 2,
+    llm_init_updates: int = 3,
     llm_forgetful: bool = False,
     # Validation rollback controls
     valid_patience: int = 20,
