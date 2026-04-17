@@ -99,6 +99,21 @@ RL_reward = composite + max(pool_improvement, 0)
 - 权重仍为 ±1（方向由 IC 符号决定）
 - `test_ensemble` 仍返回 `(IC, RankIC)` 以兼容 callback 日志
 
+#### Bugfix：`force_load_exprs` 路径现在也走复合评分
+
+此前 LLM warmstart（`DefaultInteraction._parse_and_add → pool.force_load_exprs`）
+以及 `_restore_pool_snapshot / build_pool(merged_exprs)` 路径走的是父类
+`LinearAlphaPool.force_load_exprs`，该方法调用 `_add_factor` 时会把权重设置
+为 `max(ic_ret, 0.01)` 或 `self.weights.mean()`（浮点数），而且从未触达
+`_score_expr`，导致 `_composite_scores` 与 `_factor_directions` 保持默认值，
+最终 `optimize()` 返回的方向数组对 warmstart 进来的因子无意义。
+
+`SingleFactorAlphaPool` 现在**重写** `force_load_exprs`：
+1. 对每个 expr 调用 `_score_expr` 计算 composite + direction；
+2. 在 `_add_factor` 之前把方向与得分写入 `_factor_directions` / `_composite_scores`；
+3. 最终 `self.weights = self.optimize()` 返回 ±1；
+4. 如果调用方显式传入 `weights`，也会被忽略（只保留方向），保持单因子池 ±1 不变量。
+
 ---
 
 ### 4. 训练脚本 (`scripts/rl_tick_rolling.py`)
