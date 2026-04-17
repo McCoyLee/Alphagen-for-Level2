@@ -401,10 +401,32 @@ class SingleFactorAlphaPool(MseAlphaPool):
 
     # ---- overrides ------------------------------------------------------
 
+    @property
+    def weights(self) -> np.ndarray:
+        w = self._weights[:self.size]
+        if self.size == 0:
+            return w
+        return np.where(w >= 0, 1.0, -1.0)
+
+    @weights.setter
+    def weights(self, value: np.ndarray) -> None:
+        assert value.shape == (self.size,), f"Invalid weights shape: {value.shape}"
+        self._weights[:self.size] = np.where(value >= 0, 1.0, -1.0)
+
     def optimize(self, lr=5e-4, max_steps=10000, tolerance=500) -> np.ndarray:
         if self.size == 0:
             return np.array([])
         return self._factor_directions[:self.size].copy()
+
+    def _add_factor(self, expr: Expression, ic_ret: float, ic_mut: List[float]) -> None:
+        n = self.size
+        self.exprs[n] = expr
+        self.single_ics[n] = ic_ret
+        for i in range(n):
+            self._mutual_ics[i][n] = self._mutual_ics[n][i] = ic_mut[i]
+        self._extra_info[n] = self._get_extra_info(expr)
+        self._weights[n] = self._factor_directions[n]
+        self.size += 1
 
     def _calc_ics(
         self,
