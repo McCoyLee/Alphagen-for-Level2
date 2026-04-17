@@ -471,6 +471,23 @@ class SingleFactorAlphaPool(MseAlphaPool):
         """Cache nothing; direction is stored in _factor_directions."""
         return None
 
+    def to_json_dict(self) -> Dict[str, Any]:
+        dirs = self._factor_directions[:self.size]
+        return {
+            "exprs": [str(expr) for expr in self.exprs[:self.size]],
+            "weights": [1.0 if d >= 0 else -1.0 for d in dirs],
+        }
+
+    @property
+    def state(self) -> Dict[str, Any]:
+        dirs = self._factor_directions[:self.size]
+        return {
+            "exprs": self.exprs[:self.size],
+            "ics_ret": list(self.single_ics[:self.size]),
+            "weights": [1.0 if d >= 0 else -1.0 for d in dirs],
+            "best_ic_ret": self.best_ic_ret
+        }
+
     def _swap_idx(self, i: int, j: int) -> None:
         super()._swap_idx(i, j)
         self._composite_scores[i], self._composite_scores[j] = (
