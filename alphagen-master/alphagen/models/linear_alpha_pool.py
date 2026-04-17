@@ -460,6 +460,54 @@ class SingleFactorAlphaPool(MseAlphaPool):
 
     # ---- main entry point -----------------------------------------------
 
+    def force_load_exprs(
+        self,
+        exprs: List[Expression],
+        weights: Optional[List[float]] = None,
+    ) -> None:
+        """Warm-load factors with composite scoring (weights are always ±1).
+
+        Any externally supplied ``weights`` are reduced to their signs so the
+        ±1 invariant of the single-factor pool holds.
+        """
+        self._failure_cache = set()
+        old_ic = self.evaluate_ensemble()
+        old_pool: List[Expression] = self.exprs[:self.size]  # type: ignore
+        added: List[Expression] = []
+        for expr in exprs:
+            if self.size >= self.capacity:
+                break
+            try:
+                ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=None)
+            except (OutOfDataRangeError, TypeError):
+                continue
+            if ic_ret is None or ic_mut is None or np.isnan(ic_ret):
+                continue
+            try:
+                composite, ts_ic, profit, direction = self._score_expr(expr)
+            except (OutOfDataRangeError, TypeError, ValueError):
+                continue
+            if np.isnan(composite) or np.isnan(direction):
+                continue
+            n = self.size
+            self._composite_scores[n] = composite
+            self._factor_directions[n] = direction
+            self._add_factor(expr, ic_ret, ic_mut)
+            added.append(expr)
+
+        # Always use ±1 directions; ignore provided weights' magnitudes
+        self.weights = self.optimize()
+
+        new_ic, new_obj = self.calculate_ic_and_objective()
+        self._maybe_update_best(new_ic, new_obj)
+        self.update_history.append(AddRemoveAlphas(
+            added_exprs=added,
+            removed_idx=[],
+            old_pool=old_pool,
+            old_pool_ic=old_ic,
+            new_pool_ic=new_ic,
+        ))
+
     def try_new_expr(self, expr: Expression) -> float:
         # Quick IC filter (cheap)
         ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=None)
