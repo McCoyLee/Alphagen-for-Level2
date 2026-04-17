@@ -5,6 +5,7 @@ Drop-in replacement for Level2Calculator, using TickStockData.
 """
 
 from typing import Optional
+import inspect
 import torch
 from torch import Tensor
 from alphagen.data.calculator import TensorAlphaCalculator
@@ -31,10 +32,18 @@ class TickCalculator(TensorAlphaCalculator):
                 self._normalize_single(raw_target_tensor)
                 if self._single_instrument else normalize_by_day(raw_target_tensor)
             )
-        super().__init__(
-            target_tensor,
-            raw_target=raw_target_tensor,
-        )
+        init_params = inspect.signature(TensorAlphaCalculator.__init__).parameters
+        if "raw_target" in init_params:
+            super().__init__(
+                target_tensor,
+                raw_target=raw_target_tensor,
+            )
+        else:
+            # Backward compatibility for older alphagen versions whose
+            # TensorAlphaCalculator.__init__(...) only accepts `target`.
+            super().__init__(target_tensor)
+            # Ensure profit-related logic can still access raw returns.
+            self._raw_target = raw_target_tensor
 
     def evaluate_alpha(self, expr: Expression) -> Tensor:
         value = expr.evaluate(self.data)
