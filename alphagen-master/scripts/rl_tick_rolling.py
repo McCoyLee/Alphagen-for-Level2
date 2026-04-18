@@ -601,6 +601,7 @@ def train_one_window(
                 ic_lower_bound=None,
                 l1_alpha=0.0,
                 device=device,
+                ic_mut_threshold=ic_mut_threshold,
                 holding_bars=max_future_bars,
                 bars_per_day=_bars_per_day,
                 window_days=sf_window_days,
@@ -642,7 +643,8 @@ def train_one_window(
     if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] Single-factor composite-reward pool: "
               f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
-              f"rank_ic={sf_use_rank_ic}, window={sf_window_days}d")
+              f"rank_ic={sf_use_rank_ic}, window={sf_window_days}d, "
+              f"ic_mut_threshold={ic_mut_threshold}")
     elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
               f"Falling back to MseAlphaPool.")
