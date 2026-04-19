@@ -201,7 +201,7 @@ def plot_convergence(
     Generates a 2x2 figure:
       - Top-left: Pool Best IC (train) over steps
       - Top-right: Valid IC & Test IC over steps
-      - Bottom-left: Pool Size & Significant Alphas over steps
+      - Bottom-left: Generalization gap (Valid - Test) over steps
       - Bottom-right: Eval Count over steps
  
     Args:
@@ -276,13 +276,16 @@ def plot_convergence(
     ax2.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
  
-    # Bottom-left: Pool Size
+    # Bottom-left: Generalization gap
     ax = axes[1, 0]
-    ax.plot(steps, pool_size, "b-", linewidth=1.2, label="Pool Size")
-    ax.plot(steps, pool_sig, "orange", linewidth=1.2, label="Significant Alphas")
+    ic_gap = [v - t for v, t in zip(valid_ic, test_ic)]
+    ric_gap = [v - t for v, t in zip(valid_ric, test_ric)]
+    ax.plot(steps, ic_gap, "teal", linewidth=1.2, label="IC Gap (Valid-Test)")
+    ax.plot(steps, ric_gap, "brown", linewidth=1.0, linestyle="--", label="RankIC Gap (Valid-Test)")
+    ax.axhline(0.0, color="gray", linewidth=0.8, linestyle=":")
     ax.set_xlabel("Timestep")
-    ax.set_ylabel("Count")
-    ax.set_title("Alpha Pool Growth")
+    ax.set_ylabel("Gap")
+    ax.set_title("Generalization Gap")
     ax.legend()
     ax.grid(True, alpha=0.3)
  

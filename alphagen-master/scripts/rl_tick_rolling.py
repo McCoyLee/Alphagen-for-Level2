@@ -152,6 +152,31 @@ class TickRollingCallback(BaseCallback):
         self._valid_cooldown_count: int = 0
         os.makedirs(self.save_path, exist_ok=True)
 
+    def _pool_factor_mean_ic(self, calculator: TickCalculator) -> Tuple[float, float]:
+        """
+        Mean single-factor IC/RankIC across current pool expressions.
+        Used for convergence reporting to reduce dependence on ensemble weighting.
+        """
+        exprs = [e for e in self.pool.exprs[:self.pool.size] if e is not None]
+        if len(exprs) == 0:
+            return 0.0, 0.0
+
+        ic_vals: List[float] = []
+        ric_vals: List[float] = []
+        for expr in exprs:
+            try:
+                ic_vals.append(float(calculator.calc_single_IC_ret(expr)))
+                ric_vals.append(float(calculator.calc_single_rIC_ret(expr)))
+            except Exception:
+                continue
+
+        if len(ic_vals) == 0:
+            return 0.0, 0.0
+
+        ic_arr = np.array(ic_vals, dtype=float)
+        ric_arr = np.array(ric_vals, dtype=float) if len(ric_vals) > 0 else np.array([0.0])
+        return float(np.nanmean(ic_arr)), float(np.nanmean(ric_arr))
+
     def _on_step(self) -> bool:
         return True
 
@@ -176,13 +201,13 @@ class TickRollingCallback(BaseCallback):
         self.logger.record('pool/eval_cnt', pool.eval_cnt)
         self.logger.record('pool/global_eval_cnt', self._global_eval_cnt)
 
-        valid_ic_raw, valid_rank_ic_raw = pool.test_ensemble(self.valid_calculator)
+        valid_ic_raw, valid_rank_ic_raw = self._pool_factor_mean_ic(self.valid_calculator)
 
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
         test_results = []
         for i, test_calc in enumerate(self.test_calculators, start=1):
-            ic_test, rank_ic_test = pool.test_ensemble(test_calc)
+            ic_test, rank_ic_test = self._pool_factor_mean_ic(test_calc)
             test_results.append((ic_test, rank_ic_test))
             if n_days > 0:
                 ic_test_mean += ic_test * test_calc.data.n_days / n_days
