@@ -348,8 +348,6 @@ class TickRollingCallback(BaseCallback):
                 and hasattr(self.model, "policy")
                 and hasattr(self.model.policy, "optimizer")):
             self.model.policy.optimizer.load_state_dict(self._best_valid_optimizer_state)
-        if hasattr(self.model, "rollout_buffer"):
-            self.model.rollout_buffer.reset()
 
     def _aggressive_llm_inject(self, logger) -> None:
         try:
