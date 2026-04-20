@@ -666,9 +666,10 @@ def train_one_window(
             p.force_load_exprs(exprs)
         return p
     if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
+        window_desc = "full-span" if sf_window_days <= 0 else f"{sf_window_days}d"
         print(f"[Window {wid}] Single-factor composite-reward pool: "
               f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
-              f"rank_ic={sf_use_rank_ic}, window={sf_window_days}d, "
+              f"rank_ic={sf_use_rank_ic}, window={window_desc}, "
               f"ic_mut_threshold={ic_mut_threshold}")
     elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
@@ -957,6 +958,8 @@ def main(
     :param ic_mut_threshold: Mutual IC rejection threshold
     :param diversity_bonus: Reward bonus for novel alphas
     :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
+    :param sf_window_days: Window size for ts-IC scoring in single-factor mode.
+        Set <= 0 to disable windowing and evaluate IC on the full training span each time.
     :param llm_warmstart: Use LLM to generate initial alpha pool
     :param use_llm: Enable periodic LLM injection during RL training
     :param llm_every_n_steps: Invoke LLM every N steps
