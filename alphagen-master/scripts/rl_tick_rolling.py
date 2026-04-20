@@ -35,6 +35,7 @@ Usage:
 
 import json
 import os
+import copy
 from typing import Optional, List, Union, Tuple, Dict
 from datetime import datetime
 from collections import deque, defaultdict
@@ -148,6 +149,8 @@ class TickRollingCallback(BaseCallback):
         self._valid_patience = valid_patience
         self._best_valid_ic: float = -999.0
         self._best_valid_snapshot: Optional[dict] = None
+        self._best_valid_model_params: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+        self._best_valid_optimizer_state: Optional[dict] = None
         self._valid_no_improve_count: int = 0
         self._valid_cooldown_count: int = 0
         os.makedirs(self.save_path, exist_ok=True)
@@ -155,18 +158,25 @@ class TickRollingCallback(BaseCallback):
     def _pool_factor_mean_ic(self, calculator: TickCalculator) -> Tuple[float, float]:
         """
         Mean single-factor IC/RankIC across current pool expressions.
-        Used for convergence reporting to reduce dependence on ensemble weighting.
+        Use deployed direction (weight sign) so the metric matches trading orientation.
         """
-        exprs = [e for e in self.pool.exprs[:self.pool.size] if e is not None]
-        if len(exprs) == 0:
+        pool = self.pool
+        if pool.size <= 0:
             return 0.0, 0.0
 
         ic_vals: List[float] = []
         ric_vals: List[float] = []
-        for expr in exprs:
+        for i in range(pool.size):
+            expr = pool.exprs[i]
+            if expr is None:
+                continue
             try:
-                ic_vals.append(float(calculator.calc_single_IC_ret(expr)))
-                ric_vals.append(float(calculator.calc_single_rIC_ret(expr)))
+                ic = float(calculator.calc_single_IC_ret(expr))
+                ric = float(calculator.calc_single_rIC_ret(expr))
+                w = float(pool.weights[i]) if i < len(pool.weights) else 1.0
+                direction = 1.0 if w >= 0 else -1.0
+                ic_vals.append(ic * direction)
+                ric_vals.append(ric * direction)
             except Exception:
                 continue
 
@@ -228,6 +238,9 @@ class TickRollingCallback(BaseCallback):
                 "best_ic_ret": float(pool.best_ic_ret),
                 "eval_cnt": int(pool.eval_cnt),
             }
+            self._best_valid_model_params = copy.deepcopy(self.model.get_parameters())
+            if hasattr(self.model, "policy") and hasattr(self.model.policy, "optimizer"):
+                self._best_valid_optimizer_state = copy.deepcopy(self.model.policy.optimizer.state_dict())
         else:
             if self._valid_cooldown_count > 0:
                 self._valid_cooldown_count -= 1
@@ -327,6 +340,16 @@ class TickRollingCallback(BaseCallback):
             pool.best_ic_ret = float(snapshot["best_ic_ret"])
         if "eval_cnt" in snapshot:
             pool.eval_cnt = int(snapshot["eval_cnt"])
+
+        # Joint rollback: restore policy parameters + optimizer state together with pool
+        if self._best_valid_model_params is not None:
+            self.model.set_parameters(self._best_valid_model_params, exact_match=True)
+        if (self._best_valid_optimizer_state is not None
+                and hasattr(self.model, "policy")
+                and hasattr(self.model.policy, "optimizer")):
+            self.model.policy.optimizer.load_state_dict(self._best_valid_optimizer_state)
+        if hasattr(self.model, "rollout_buffer"):
+            self.model.rollout_buffer.reset()
 
     def _aggressive_llm_inject(self, logger) -> None:
         try:
