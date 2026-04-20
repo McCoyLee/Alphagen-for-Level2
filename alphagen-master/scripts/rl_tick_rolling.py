@@ -152,6 +152,31 @@ class TickRollingCallback(BaseCallback):
         self._valid_cooldown_count: int = 0
         os.makedirs(self.save_path, exist_ok=True)
 
+    def _pool_factor_mean_ic(self, calculator: TickCalculator) -> Tuple[float, float]:
+        """
+        Mean single-factor IC/RankIC across current pool expressions.
+        Used for convergence reporting to reduce dependence on ensemble weighting.
+        """
+        exprs = [e for e in self.pool.exprs[:self.pool.size] if e is not None]
+        if len(exprs) == 0:
+            return 0.0, 0.0
+
+        ic_vals: List[float] = []
+        ric_vals: List[float] = []
+        for expr in exprs:
+            try:
+                ic_vals.append(float(calculator.calc_single_IC_ret(expr)))
+                ric_vals.append(float(calculator.calc_single_rIC_ret(expr)))
+            except Exception:
+                continue
+
+        if len(ic_vals) == 0:
+            return 0.0, 0.0
+
+        ic_arr = np.array(ic_vals, dtype=float)
+        ric_arr = np.array(ric_vals, dtype=float) if len(ric_vals) > 0 else np.array([0.0])
+        return float(np.nanmean(ic_arr)), float(np.nanmean(ric_arr))
+
     def _on_step(self) -> bool:
         return True
 
@@ -176,13 +201,13 @@ class TickRollingCallback(BaseCallback):
         self.logger.record('pool/eval_cnt', pool.eval_cnt)
         self.logger.record('pool/global_eval_cnt', self._global_eval_cnt)
 
-        valid_ic_raw, valid_rank_ic_raw = pool.test_ensemble(self.valid_calculator)
+        valid_ic_raw, valid_rank_ic_raw = self._pool_factor_mean_ic(self.valid_calculator)
 
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
         test_results = []
         for i, test_calc in enumerate(self.test_calculators, start=1):
-            ic_test, rank_ic_test = pool.test_ensemble(test_calc)
+            ic_test, rank_ic_test = self._pool_factor_mean_ic(test_calc)
             test_results.append((ic_test, rank_ic_test))
             if n_days > 0:
                 ic_test_mean += ic_test * test_calc.data.n_days / n_days
@@ -601,6 +626,7 @@ def train_one_window(
                 ic_lower_bound=None,
                 l1_alpha=0.0,
                 device=device,
+                ic_mut_threshold=ic_mut_threshold,
                 holding_bars=max_future_bars,
                 bars_per_day=_bars_per_day,
                 window_days=sf_window_days,
@@ -640,9 +666,11 @@ def train_one_window(
             p.force_load_exprs(exprs)
         return p
     if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
+        window_desc = "full-span" if sf_window_days <= 0 else f"{sf_window_days}d"
         print(f"[Window {wid}] Single-factor composite-reward pool: "
               f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
-              f"rank_ic={sf_use_rank_ic}, window={sf_window_days}d")
+              f"rank_ic={sf_use_rank_ic}, window={window_desc}, "
+              f"ic_mut_threshold={ic_mut_threshold}")
     elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
               f"Falling back to MseAlphaPool.")
@@ -930,6 +958,8 @@ def main(
     :param ic_mut_threshold: Mutual IC rejection threshold
     :param diversity_bonus: Reward bonus for novel alphas
     :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
+    :param sf_window_days: Window size for ts-IC scoring in single-factor mode.
+        Set <= 0 to disable windowing and evaluate IC on the full training span each time.
     :param llm_warmstart: Use LLM to generate initial alpha pool
     :param use_llm: Enable periodic LLM injection during RL training
     :param llm_every_n_steps: Invoke LLM every N steps
