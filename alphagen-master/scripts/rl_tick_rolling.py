@@ -35,6 +35,7 @@ Usage:
 
 import json
 import os
+import copy
 from typing import Optional, List, Union, Tuple, Dict
 from datetime import datetime
 from collections import deque, defaultdict
@@ -148,9 +149,43 @@ class TickRollingCallback(BaseCallback):
         self._valid_patience = valid_patience
         self._best_valid_ic: float = -999.0
         self._best_valid_snapshot: Optional[dict] = None
+        self._best_valid_model_params: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+        self._best_valid_optimizer_state: Optional[dict] = None
         self._valid_no_improve_count: int = 0
         self._valid_cooldown_count: int = 0
         os.makedirs(self.save_path, exist_ok=True)
+
+    def _pool_factor_mean_ic(self, calculator: TickCalculator) -> Tuple[float, float]:
+        """
+        Mean single-factor IC/RankIC across current pool expressions.
+        Use deployed direction (weight sign) so the metric matches trading orientation.
+        """
+        pool = self.pool
+        if pool.size <= 0:
+            return 0.0, 0.0
+
+        ic_vals: List[float] = []
+        ric_vals: List[float] = []
+        for i in range(pool.size):
+            expr = pool.exprs[i]
+            if expr is None:
+                continue
+            try:
+                ic = float(calculator.calc_single_IC_ret(expr))
+                ric = float(calculator.calc_single_rIC_ret(expr))
+                w = float(pool.weights[i]) if i < len(pool.weights) else 1.0
+                direction = 1.0 if w >= 0 else -1.0
+                ic_vals.append(ic * direction)
+                ric_vals.append(ric * direction)
+            except Exception:
+                continue
+
+        if len(ic_vals) == 0:
+            return 0.0, 0.0
+
+        ic_arr = np.array(ic_vals, dtype=float)
+        ric_arr = np.array(ric_vals, dtype=float) if len(ric_vals) > 0 else np.array([0.0])
+        return float(np.nanmean(ic_arr)), float(np.nanmean(ric_arr))
 
     def _on_step(self) -> bool:
         return True
@@ -176,13 +211,13 @@ class TickRollingCallback(BaseCallback):
         self.logger.record('pool/eval_cnt', pool.eval_cnt)
         self.logger.record('pool/global_eval_cnt', self._global_eval_cnt)
 
-        valid_ic_raw, valid_rank_ic_raw = pool.test_ensemble(self.valid_calculator)
+        valid_ic_raw, valid_rank_ic_raw = self._pool_factor_mean_ic(self.valid_calculator)
 
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
         ic_test_mean, rank_ic_test_mean = 0., 0.
         test_results = []
         for i, test_calc in enumerate(self.test_calculators, start=1):
-            ic_test, rank_ic_test = pool.test_ensemble(test_calc)
+            ic_test, rank_ic_test = self._pool_factor_mean_ic(test_calc)
             test_results.append((ic_test, rank_ic_test))
             if n_days > 0:
                 ic_test_mean += ic_test * test_calc.data.n_days / n_days
@@ -203,6 +238,9 @@ class TickRollingCallback(BaseCallback):
                 "best_ic_ret": float(pool.best_ic_ret),
                 "eval_cnt": int(pool.eval_cnt),
             }
+            self._best_valid_model_params = copy.deepcopy(self.model.get_parameters())
+            if hasattr(self.model, "policy") and hasattr(self.model.policy, "optimizer"):
+                self._best_valid_optimizer_state = copy.deepcopy(self.model.policy.optimizer.state_dict())
         else:
             if self._valid_cooldown_count > 0:
                 self._valid_cooldown_count -= 1
@@ -302,6 +340,14 @@ class TickRollingCallback(BaseCallback):
             pool.best_ic_ret = float(snapshot["best_ic_ret"])
         if "eval_cnt" in snapshot:
             pool.eval_cnt = int(snapshot["eval_cnt"])
+
+        # Joint rollback: restore policy parameters + optimizer state together with pool
+        if self._best_valid_model_params is not None:
+            self.model.set_parameters(self._best_valid_model_params, exact_match=True)
+        if (self._best_valid_optimizer_state is not None
+                and hasattr(self.model, "policy")
+                and hasattr(self.model.policy, "optimizer")):
+            self.model.policy.optimizer.load_state_dict(self._best_valid_optimizer_state)
 
     def _aggressive_llm_inject(self, logger) -> None:
         try:
@@ -517,6 +563,7 @@ def train_one_window(
     sf_profit_weight: float = 0.5,
     sf_use_rank_ic: bool = False,
     sf_window_days: int = 20,
+    window_days: Optional[int] = None,  # backward-compatible alias of sf_window_days
     sf_turnover_penalty: float = 0.001,
     sf_ic_std_penalty: float = 0.0,
     # LLM options
@@ -601,6 +648,7 @@ def train_one_window(
                 ic_lower_bound=None,
                 l1_alpha=0.0,
                 device=device,
+                ic_mut_threshold=ic_mut_threshold,
                 holding_bars=max_future_bars,
                 bars_per_day=_bars_per_day,
                 window_days=sf_window_days,
@@ -640,9 +688,11 @@ def train_one_window(
             p.force_load_exprs(exprs)
         return p
     if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
+        window_desc = "full-span" if sf_window_days <= 0 else f"{sf_window_days}d"
         print(f"[Window {wid}] Single-factor composite-reward pool: "
               f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
-              f"rank_ic={sf_use_rank_ic}, window={sf_window_days}d")
+              f"rank_ic={sf_use_rank_ic}, window={window_desc}, "
+              f"ic_mut_threshold={ic_mut_threshold}")
     elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
               f"Falling back to MseAlphaPool.")
@@ -873,6 +923,7 @@ def main(
     sf_profit_weight: float = 0.5,
     sf_use_rank_ic: bool = False,
     sf_window_days: int = 20,
+    window_days: Optional[int] = None,  # alias of sf_window_days
     sf_turnover_penalty: float = 0.001,
     sf_ic_std_penalty: float = 0.0,
     # LLM options
@@ -930,6 +981,9 @@ def main(
     :param ic_mut_threshold: Mutual IC rejection threshold
     :param diversity_bonus: Reward bonus for novel alphas
     :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
+    :param sf_window_days: Window size for ts-IC scoring in single-factor mode.
+        Set <= 0 to disable windowing and evaluate IC on the full training span each time.
+    :param window_days: Alias of sf_window_days. Prefer sf_window_days in new commands.
     :param llm_warmstart: Use LLM to generate initial alpha pool
     :param use_llm: Enable periodic LLM injection during RL training
     :param llm_every_n_steps: Invoke LLM every N steps
@@ -961,6 +1015,10 @@ def main(
 
     if isinstance(instruments, str) and instruments.startswith("["):
         instruments = json.loads(instruments)
+
+    if window_days is not None:
+        sf_window_days = int(window_days)
+        print(f"[Tick Rolling] Using alias --window_days={window_days}, mapped to --sf_window_days={sf_window_days}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")

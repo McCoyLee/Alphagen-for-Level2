@@ -42,7 +42,7 @@ class AlphaCalculator(metaclass=ABCMeta):
     def calc_single_ts_IC_ret(
         self, expr: Expression,
         bars_per_day: int = 1,
-        window_days: int = 20,
+        window_days: Optional[int] = 20,
         use_rank: bool = False,
     ) -> Tuple[float, float]:
         """Windowed time-series IC.
@@ -175,7 +175,7 @@ class TensorAlphaCalculator(AlphaCalculator):
     def calc_single_ts_IC_ret(
         self, expr: Expression,
         bars_per_day: int = 1,
-        window_days: int = 20,
+        window_days: Optional[int] = 20,
         use_rank: bool = False,
     ) -> Tuple[float, float]:
         with torch.no_grad():
@@ -215,12 +215,14 @@ class TensorAlphaCalculator(AlphaCalculator):
 
     @staticmethod
     def _window_mean_std(
-        daily_ics: Tensor, window_days: int
+        daily_ics: Tensor, window_days: Optional[int]
     ) -> Tuple[float, float]:
         valid = daily_ics[~daily_ics.isnan()]
         n = len(valid)
         if n == 0:
             return 0.0, 0.0
+        if window_days is None or window_days <= 0:
+            return valid.mean().item(), (valid.std().item() if n > 1 else 0.0)
         n_win = n // window_days
         if n_win < 1:
             return valid.mean().item(), (valid.std().item() if n > 1 else 0.0)
