@@ -563,6 +563,7 @@ def train_one_window(
     sf_profit_weight: float = 0.5,
     sf_use_rank_ic: bool = False,
     sf_window_days: int = 20,
+    window_days: Optional[int] = None,  # backward-compatible alias of sf_window_days
     sf_turnover_penalty: float = 0.001,
     sf_ic_std_penalty: float = 0.0,
     # LLM options
@@ -922,6 +923,7 @@ def main(
     sf_profit_weight: float = 0.5,
     sf_use_rank_ic: bool = False,
     sf_window_days: int = 20,
+    window_days: Optional[int] = None,  # alias of sf_window_days
     sf_turnover_penalty: float = 0.001,
     sf_ic_std_penalty: float = 0.0,
     # LLM options
@@ -981,6 +983,7 @@ def main(
     :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
     :param sf_window_days: Window size for ts-IC scoring in single-factor mode.
         Set <= 0 to disable windowing and evaluate IC on the full training span each time.
+    :param window_days: Alias of sf_window_days. Prefer sf_window_days in new commands.
     :param llm_warmstart: Use LLM to generate initial alpha pool
     :param use_llm: Enable periodic LLM injection during RL training
     :param llm_every_n_steps: Invoke LLM every N steps
@@ -1012,6 +1015,10 @@ def main(
 
     if isinstance(instruments, str) and instruments.startswith("["):
         instruments = json.loads(instruments)
+
+    if window_days is not None:
+        sf_window_days = int(window_days)
+        print(f"[Tick Rolling] Using alias --window_days={window_days}, mapped to --sf_window_days={sf_window_days}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
