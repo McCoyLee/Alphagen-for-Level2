@@ -392,13 +392,21 @@ class SingleFactorAlphaPool(MseAlphaPool):
             holding_bars=self.holding_bars,
             turnover_penalty=self.turnover_penalty,
         )
-        direction = 1.0 if ts_ic_mean >= 0 else -1.0
-        ic_score = abs(ts_ic_mean) - self.ic_std_penalty * ts_ic_std
-        profit_directed = profit_raw * direction
-        composite = (
-            self.ic_weight * max(ic_score, 0.0)
-            + self.profit_weight * max(profit_directed, 0.0)
+
+        # Scheme-B: evaluate BOTH directions symmetrically and pick the better one.
+        ic_penalty = self.ic_std_penalty * ts_ic_std
+        score_pos = (
+            self.ic_weight * max(ts_ic_mean - ic_penalty, 0.0)
+            + self.profit_weight * max(profit_raw, 0.0)
         )
+        score_neg = (
+            self.ic_weight * max(-ts_ic_mean - ic_penalty, 0.0)
+            + self.profit_weight * max(-profit_raw, 0.0)
+        )
+        if score_pos >= score_neg:
+            direction, composite = 1.0, score_pos
+        else:
+            direction, composite = -1.0, score_neg
         return composite, ts_ic_mean, profit_raw, direction
 
     # ---- overrides ------------------------------------------------------

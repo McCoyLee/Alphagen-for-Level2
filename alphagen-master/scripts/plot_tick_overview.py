@@ -30,8 +30,6 @@ if PROJECT_ROOT not in sys.path:
 
 from alphagen_level2.stock_data_tick import TickStockData, TickFeatureType
 from alphagen_level2.config_tick import TICK_FEATURES
-
-
 def _feature_series(data: TickStockData, stock_idx: int = 0) -> Dict[str, pd.Series]:
     """
     Return usable feature series (excluding backtrack/future margins).
