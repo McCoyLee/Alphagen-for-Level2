@@ -351,6 +351,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
         ic_lower_bound: Optional[float] = None,
         l1_alpha: float = 0.0,
         device: torch.device = torch.device("cpu"),
+        ic_mut_threshold: Optional[float] = 0.99,
         # ---- composite-reward knobs ----
         holding_bars: int = 100,
         bars_per_day: int = 4800,
@@ -370,6 +371,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
         self.use_rank_ic = use_rank_ic
         self.turnover_penalty = turnover_penalty
         self.ic_std_penalty = ic_std_penalty
+        self._ic_mut_threshold = ic_mut_threshold
         # _composite_scores mirrors single_ics but stores the composite score
         self._composite_scores: np.ndarray = np.zeros(capacity + 1)
         # _factor_directions: +1 / -1 per factor (IC sign)
@@ -390,13 +392,21 @@ class SingleFactorAlphaPool(MseAlphaPool):
             holding_bars=self.holding_bars,
             turnover_penalty=self.turnover_penalty,
         )
-        direction = 1.0 if ts_ic_mean >= 0 else -1.0
-        ic_score = abs(ts_ic_mean) - self.ic_std_penalty * ts_ic_std
-        profit_directed = profit_raw * direction
-        composite = (
-            self.ic_weight * max(ic_score, 0.0)
-            + self.profit_weight * max(profit_directed, 0.0)
+
+        # Scheme-B: evaluate BOTH directions symmetrically and pick the better one.
+        ic_penalty = self.ic_std_penalty * ts_ic_std
+        score_pos = (
+            self.ic_weight * max(ts_ic_mean - ic_penalty, 0.0)
+            + self.profit_weight * max(profit_raw, 0.0)
         )
+        score_neg = (
+            self.ic_weight * max(-ts_ic_mean - ic_penalty, 0.0)
+            + self.profit_weight * max(-profit_raw, 0.0)
+        )
+        if score_pos >= score_neg:
+            direction, composite = 1.0, score_pos
+        else:
+            direction, composite = -1.0, score_neg
         return composite, ts_ic_mean, profit_raw, direction
 
     # ---- overrides ------------------------------------------------------
@@ -433,13 +443,22 @@ class SingleFactorAlphaPool(MseAlphaPool):
         expr: Expression,
         ic_mut_threshold: Optional[float] = None,
     ) -> Tuple[float, Optional[List[float]]]:
-        """Bypass mutual-IC; use global IC only for lower-bound filtering."""
+        """Use global IC + optional mutual-IC filter for de-correlation."""
         single_ic = self.calculator.calc_single_IC_ret(expr)
         if np.isnan(single_ic):
             return single_ic, None
         if self._ic_lower_bound is not None and abs(single_ic) < self._ic_lower_bound:
             return single_ic, None
-        return single_ic, [0.0] * self.size
+
+        mutual_ics: List[float] = []
+        for i in range(self.size):
+            mutual_ic = self.calculator.calc_mutual_IC(expr, self.exprs[i])  # type: ignore[arg-type]
+            if np.isnan(mutual_ic):
+                return single_ic, None
+            if ic_mut_threshold is not None and abs(mutual_ic) > ic_mut_threshold:
+                return single_ic, None
+            mutual_ics.append(mutual_ic)
+        return single_ic, mutual_ics
 
     def _best_single_index(self) -> Optional[int]:
         if self.size == 0:
@@ -517,7 +536,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
             if self.size >= self.capacity:
                 break
             try:
-                ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=None)
+                ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=self._ic_mut_threshold)
             except (OutOfDataRangeError, TypeError):
                 continue
             if ic_ret is None or ic_mut is None or np.isnan(ic_ret):
@@ -549,7 +568,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
 
     def try_new_expr(self, expr: Expression) -> float:
         # Quick IC filter (cheap)
-        ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=None)
+        ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=self._ic_mut_threshold)
         if ic_ret is None or ic_mut is None or np.isnan(ic_ret):
             return 0.0
         if str(expr) in self._failure_cache:
