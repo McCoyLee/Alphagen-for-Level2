@@ -566,6 +566,7 @@ def train_one_window(
     window_days: Optional[int] = None,  # backward-compatible alias of sf_window_days
     sf_turnover_penalty: float = 0.001,
     sf_ic_std_penalty: float = 0.0,
+    sf_trivial_penalty: float = 0.0,
     # LLM options
     llm_warmstart: bool = False,
     use_llm: bool = False,
@@ -657,6 +658,7 @@ def train_one_window(
                 use_rank_ic=sf_use_rank_ic,
                 turnover_penalty=sf_turnover_penalty,
                 ic_std_penalty=sf_ic_std_penalty,
+                trivial_penalty=sf_trivial_penalty,
             )
         elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
             p = MseAlphaPool(
@@ -692,7 +694,8 @@ def train_one_window(
         print(f"[Window {wid}] Single-factor composite-reward pool: "
               f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
               f"rank_ic={sf_use_rank_ic}, window={window_desc}, "
-              f"ic_mut_threshold={ic_mut_threshold}")
+              f"ic_mut_threshold={ic_mut_threshold}, "
+              f"trivial_penalty={sf_trivial_penalty}")
     elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] [Warn] `SingleFactorAlphaPool` is unavailable in current alphagen package. "
               f"Falling back to MseAlphaPool.")
@@ -926,6 +929,7 @@ def main(
     window_days: Optional[int] = None,  # alias of sf_window_days
     sf_turnover_penalty: float = 0.001,
     sf_ic_std_penalty: float = 0.0,
+    sf_trivial_penalty: float = 0.0,
     # LLM options
     llm_warmstart: bool = False,
     use_llm: bool = False,
@@ -984,6 +988,9 @@ def main(
     :param sf_window_days: Window size for ts-IC scoring in single-factor mode.
         Set <= 0 to disable windowing and evaluate IC on the full training span each time.
     :param window_days: Alias of sf_window_days. Prefer sf_window_days in new commands.
+    :param sf_trivial_penalty: If > 0, expressions that are only a single feature combined
+        with constants (no rolling operator, ≤1 feature leaf) receive reward = -sf_trivial_penalty
+        and are rejected from the pool. 0 disables (default).
     :param llm_warmstart: Use LLM to generate initial alpha pool
     :param use_llm: Enable periodic LLM injection during RL training
     :param llm_every_n_steps: Invoke LLM every N steps
@@ -1054,6 +1061,7 @@ def main(
         "sf_ic_weight": sf_ic_weight, "sf_profit_weight": sf_profit_weight,
         "sf_use_rank_ic": sf_use_rank_ic, "sf_window_days": sf_window_days,
         "sf_turnover_penalty": sf_turnover_penalty, "sf_ic_std_penalty": sf_ic_std_penalty,
+        "sf_trivial_penalty": sf_trivial_penalty,
         "llm_warmstart": llm_warmstart, "use_llm": use_llm,
         "llm_every_n_steps": llm_every_n_steps, "drop_rl_n": drop_rl_n,
         "llm_replace_n": llm_replace_n, "n_envs": n_envs,
@@ -1101,6 +1109,7 @@ def main(
                 sf_window_days=sf_window_days,
                 sf_turnover_penalty=sf_turnover_penalty,
                 sf_ic_std_penalty=sf_ic_std_penalty,
+                sf_trivial_penalty=sf_trivial_penalty,
                 llm_warmstart=llm_warmstart,
                 use_llm=use_llm,
                 llm_every_n_steps=llm_every_n_steps,

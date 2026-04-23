@@ -495,3 +495,33 @@ Operators: List[Type[Operator]] = [
     # Pair rolling
     Cov, Corr
 ]
+
+
+def is_trivial_expr(expr: Expression) -> bool:
+    """Return True when ``expr`` is effectively "a single feature combined only with constants".
+
+    An expression is trivial if it contains at most one ``Feature`` leaf, zero
+    ``RollingOperator``/``PairRollingOperator`` nodes, and is not a bare constant.
+    Trivial examples: ``$close``, ``Add($close, 1.0)``, ``Mul(2.0, $close)``,
+    ``Abs($close)``. Non-trivial: ``Mean($close, 5d)`` (rolling),
+    ``Add($close, $open)`` (two features), ``Corr($close, $volume, 20d)``.
+    """
+    n_features = 0
+    has_rolling = False
+
+    def visit(node: Expression) -> None:
+        nonlocal n_features, has_rolling
+        if isinstance(node, Feature):
+            n_features += 1
+            return
+        if isinstance(node, (RollingOperator, PairRollingOperator)):
+            has_rolling = True
+            return
+        if isinstance(node, Operator):
+            for child in node.operands:
+                visit(child)
+
+    visit(expr)
+    if has_rolling:
+        return False
+    return n_features <= 1 and expr.is_featured
