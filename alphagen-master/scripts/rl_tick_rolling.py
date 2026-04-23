@@ -558,14 +558,14 @@ def train_one_window(
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
     single_factor_mode: bool = False,
-    # Composite-reward knobs (SingleFactorAlphaPool)
-    sf_ic_weight: float = 0.5,
-    sf_profit_weight: float = 0.5,
-    sf_use_rank_ic: bool = False,
-    sf_window_days: int = 20,
-    window_days: Optional[int] = None,  # backward-compatible alias of sf_window_days
-    sf_turnover_penalty: float = 0.001,
-    sf_ic_std_penalty: float = 0.0,
+    # Rolling-zscore reward knobs (SingleFactorAlphaPool, per spec)
+    sf_alpha: float = 1.0,
+    sf_beta: float = 1.0,
+    sf_tau_ic: float = 0.05,
+    sf_tau_r: float = 1e-3,
+    sf_lookback_bars: int = 1200,
+    sf_turnover_cost: float = 0.0006,
+    sf_execution_delay: int = 1,
     sf_trivial_penalty: float = 0.0,
     # LLM options
     llm_warmstart: bool = False,
@@ -638,8 +638,6 @@ def train_one_window(
     # Build pool
     use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
 
-    _bars_per_day = datasets[0].bars_per_day
-
     def build_pool(exprs: Optional[List[Expression]] = None) -> LinearAlphaPool:
         if single_factor_mode:
             print(f"[build_pool] Creating SingleFactorAlphaPool (type={SingleFactorAlphaPool.__name__})")
@@ -651,13 +649,13 @@ def train_one_window(
                 device=device,
                 ic_mut_threshold=ic_mut_threshold,
                 holding_bars=max_future_bars,
-                bars_per_day=_bars_per_day,
-                window_days=sf_window_days,
-                ic_weight=sf_ic_weight,
-                profit_weight=sf_profit_weight,
-                use_rank_ic=sf_use_rank_ic,
-                turnover_penalty=sf_turnover_penalty,
-                ic_std_penalty=sf_ic_std_penalty,
+                execution_delay=sf_execution_delay,
+                lookback_bars=sf_lookback_bars,
+                turnover_cost=sf_turnover_cost,
+                alpha=sf_alpha,
+                beta=sf_beta,
+                tau_ic=sf_tau_ic,
+                tau_r=sf_tau_r,
                 trivial_penalty=sf_trivial_penalty,
             )
         elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
@@ -690,10 +688,11 @@ def train_one_window(
             p.force_load_exprs(exprs)
         return p
     if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
-        window_desc = "full-span" if sf_window_days <= 0 else f"{sf_window_days}d"
-        print(f"[Window {wid}] Single-factor composite-reward pool: "
-              f"ic_w={sf_ic_weight}, profit_w={sf_profit_weight}, "
-              f"rank_ic={sf_use_rank_ic}, window={window_desc}, "
+        print(f"[Window {wid}] Single-factor rolling-zscore reward pool: "
+              f"alpha={sf_alpha}, beta={sf_beta}, "
+              f"tau_ic={sf_tau_ic}, tau_r={sf_tau_r}, "
+              f"lookback={sf_lookback_bars}, holding={max_future_bars}, "
+              f"delay={sf_execution_delay}, turnover_cost={sf_turnover_cost}, "
               f"ic_mut_threshold={ic_mut_threshold}, "
               f"trivial_penalty={sf_trivial_penalty}")
     elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
@@ -869,6 +868,30 @@ def train_one_window(
     except Exception:
         pass
 
+    # Dump reward-component magnitude & distribution stats (single-factor mode)
+    reward_stats_summary: Optional[Dict[str, Dict[str, float]]] = None
+    if single_factor_mode and hasattr(pool, "dump_reward_stats"):
+        stats_path = os.path.join(window_dir, "reward_component_stats.json")
+        try:
+            reward_stats_summary = pool.dump_reward_stats(stats_path, include_raw=True)
+            comp_ic = reward_stats_summary.get("comp_ic", {})
+            comp_r  = reward_stats_summary.get("comp_r",  {})
+            abs_ic  = reward_stats_summary.get("abs_ic",  {})
+            r_bar   = reward_stats_summary.get("r_bar",   {})
+            print(
+                f"[Window {wid}] Reward-component stats (n={comp_ic.get('count', 0)}):\n"
+                f"  |IC|       mean={abs_ic.get('mean', 0):.4f}  std={abs_ic.get('std', 0):.4f}  "
+                f"p50={abs_ic.get('p50', 0):.4f}  max={abs_ic.get('max', 0):.4f}\n"
+                f"  r_bar      mean={r_bar.get('mean', 0):.3e}  std={r_bar.get('std', 0):.3e}  "
+                f"p50={r_bar.get('p50', 0):.3e}  max={r_bar.get('max', 0):.3e}\n"
+                f"  a*tanh(|IC|/t) mean={comp_ic.get('mean', 0):.4f}  std={comp_ic.get('std', 0):.4f}  "
+                f"max={comp_ic.get('max', 0):.4f}\n"
+                f"  b*tanh(r/t)    mean={comp_r.get('mean', 0):.4f}  std={comp_r.get('std', 0):.4f}  "
+                f"max={comp_r.get('max', 0):.4f}"
+            )
+        except Exception as exc:  # pragma: no cover
+            print(f"[Window {wid}] Failed to dump reward stats: {exc}")
+
     valid_ic, valid_rank_ic = pool.test_ensemble(calculators[1])
     test_ic, test_rank_ic = pool.test_ensemble(calculators[2])
 
@@ -882,6 +905,8 @@ def train_one_window(
         "pool_size": int(pool.size),
         "pool_path": final_pool_path,
     }
+    if reward_stats_summary is not None:
+        result["reward_stats"] = reward_stats_summary
 
     summary = conv_logger.summary()
     if summary:
@@ -921,14 +946,14 @@ def main(
     ic_mut_threshold: float = 0.99,
     diversity_bonus: float = 0.0,
     single_factor_mode: bool = False,
-    # Composite-reward knobs (SingleFactorAlphaPool)
-    sf_ic_weight: float = 0.5,
-    sf_profit_weight: float = 0.5,
-    sf_use_rank_ic: bool = False,
-    sf_window_days: int = 20,
-    window_days: Optional[int] = None,  # alias of sf_window_days
-    sf_turnover_penalty: float = 0.001,
-    sf_ic_std_penalty: float = 0.0,
+    # Rolling-zscore reward knobs (SingleFactorAlphaPool, per spec)
+    sf_alpha: float = 1.0,
+    sf_beta: float = 1.0,
+    sf_tau_ic: float = 0.05,
+    sf_tau_r: float = 1e-3,
+    sf_lookback_bars: int = 1200,
+    sf_turnover_cost: float = 0.0006,
+    sf_execution_delay: int = 1,
     sf_trivial_penalty: float = 0.0,
     # LLM options
     llm_warmstart: bool = False,
@@ -984,10 +1009,17 @@ def main(
     :param max_workers: Parallel HDF5 IO threads
     :param ic_mut_threshold: Mutual IC rejection threshold
     :param diversity_bonus: Reward bonus for novel alphas
-    :param single_factor_mode: If True, mine standalone factors ranked by |single IC| instead of combo IC
-    :param sf_window_days: Window size for ts-IC scoring in single-factor mode.
-        Set <= 0 to disable windowing and evaluate IC on the full training span each time.
-    :param window_days: Alias of sf_window_days. Prefer sf_window_days in new commands.
+    :param single_factor_mode: If True, mine standalone factors ranked by the
+        rolling-zscore reward (IC + realized PnL tanh-combined) instead of combo IC.
+    :param sf_alpha: Weight on ``tanh(|IC|/tau_ic)`` in the reward sum.
+    :param sf_beta: Weight on ``tanh(r_bar/tau_r)`` in the reward sum.
+    :param sf_tau_ic: Compression scale for the IC component (tau_ic in the spec).
+    :param sf_tau_r: Compression scale for the pnl component (tau_r in the spec).
+    :param sf_lookback_bars: Rolling window for z-score normalization (previous bars
+        used to compute mu_t / sigma_t). Default 1200 ≈ 1 hour of 3-second bars.
+    :param sf_turnover_cost: Per-bar holding cost lambda in ``r_t = sign(IC)*p_t*ret - lambda*|p_t|``.
+    :param sf_execution_delay: Bars of execution delay between signal observation
+        and trade entry. Default 1 means enter at mid[t+1] and exit at mid[t+1+H].
     :param sf_trivial_penalty: If > 0, expressions that are only a single feature combined
         with constants (no rolling operator, ≤1 feature leaf) receive reward = -sf_trivial_penalty
         and are rejected from the pool. 0 disables (default).
@@ -1023,10 +1055,6 @@ def main(
     if isinstance(instruments, str) and instruments.startswith("["):
         instruments = json.loads(instruments)
 
-    if window_days is not None:
-        sf_window_days = int(window_days)
-        print(f"[Tick Rolling] Using alias --window_days={window_days}, mapped to --sf_window_days={sf_window_days}")
-
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     save_root = os.path.join(
@@ -1058,9 +1086,11 @@ def main(
         "use_all_features": use_all_features, "n_features": len(features),
         "max_backtrack_bars": max_backtrack_bars, "max_future_bars": max_future_bars,
         "single_factor_mode": single_factor_mode,
-        "sf_ic_weight": sf_ic_weight, "sf_profit_weight": sf_profit_weight,
-        "sf_use_rank_ic": sf_use_rank_ic, "sf_window_days": sf_window_days,
-        "sf_turnover_penalty": sf_turnover_penalty, "sf_ic_std_penalty": sf_ic_std_penalty,
+        "sf_alpha": sf_alpha, "sf_beta": sf_beta,
+        "sf_tau_ic": sf_tau_ic, "sf_tau_r": sf_tau_r,
+        "sf_lookback_bars": sf_lookback_bars,
+        "sf_turnover_cost": sf_turnover_cost,
+        "sf_execution_delay": sf_execution_delay,
         "sf_trivial_penalty": sf_trivial_penalty,
         "llm_warmstart": llm_warmstart, "use_llm": use_llm,
         "llm_every_n_steps": llm_every_n_steps, "drop_rl_n": drop_rl_n,
@@ -1103,12 +1133,13 @@ def main(
                 ic_mut_threshold=ic_mut_threshold,
                 diversity_bonus=diversity_bonus,
                 single_factor_mode=single_factor_mode,
-                sf_ic_weight=sf_ic_weight,
-                sf_profit_weight=sf_profit_weight,
-                sf_use_rank_ic=sf_use_rank_ic,
-                sf_window_days=sf_window_days,
-                sf_turnover_penalty=sf_turnover_penalty,
-                sf_ic_std_penalty=sf_ic_std_penalty,
+                sf_alpha=sf_alpha,
+                sf_beta=sf_beta,
+                sf_tau_ic=sf_tau_ic,
+                sf_tau_r=sf_tau_r,
+                sf_lookback_bars=sf_lookback_bars,
+                sf_turnover_cost=sf_turnover_cost,
+                sf_execution_delay=sf_execution_delay,
                 sf_trivial_penalty=sf_trivial_penalty,
                 llm_warmstart=llm_warmstart,
                 use_llm=use_llm,

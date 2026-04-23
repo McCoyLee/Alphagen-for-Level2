@@ -4,14 +4,13 @@ Calculator for tick-level (3s bar) data.
 Drop-in replacement for Level2Calculator, using TickStockData.
 """
 
-from typing import Optional
-import inspect
+from typing import Optional, Dict
 import torch
 from torch import Tensor
 from alphagen.data.calculator import TensorAlphaCalculator
-from alphagen.data.expression import Expression
+from alphagen.data.expression import Expression, OutOfDataRangeError
 from alphagen.utils.pytorch_utils import normalize_by_day
-from alphagen_level2.stock_data_tick import TickStockData
+from alphagen_level2.stock_data_tick import TickStockData, TickFeatureType
 
 
 class TickCalculator(TensorAlphaCalculator):
@@ -25,25 +24,13 @@ class TickCalculator(TensorAlphaCalculator):
         self.data = data
         self._single_instrument = data.n_stocks == 1
         target_tensor = None
-        raw_target_tensor = None
         if target is not None:
             raw_target_tensor = target.evaluate(data)
             target_tensor = (
                 self._normalize_single(raw_target_tensor)
                 if self._single_instrument else normalize_by_day(raw_target_tensor)
             )
-        init_params = inspect.signature(TensorAlphaCalculator.__init__).parameters
-        if "raw_target" in init_params:
-            super().__init__(
-                target_tensor,
-                raw_target=raw_target_tensor,
-            )
-        else:
-            # Backward compatibility for older alphagen versions whose
-            # TensorAlphaCalculator.__init__(...) only accepts `target`.
-            super().__init__(target_tensor)
-            # Ensure profit-related logic can still access raw returns.
-            self._raw_target = raw_target_tensor
+        super().__init__(target_tensor)
 
     def evaluate_alpha(self, expr: Expression) -> Tensor:
         value = expr.evaluate(self.data)
@@ -111,3 +98,136 @@ class TickCalculator(TensorAlphaCalculator):
     @property
     def n_days(self) -> int:
         return self.data.n_days
+
+    # ------------------------------------------------------------------
+    # Rolling z-score + forward-return reward components
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rolling_zscore_1d(
+        x: Tensor, window: int, eps: float = 1e-8,
+    ) -> Tensor:
+        """Rolling z-score using *previous* `window` bars (strictly before t).
+
+        For each t, mu_t = mean(x[t-window : t]), sigma_t likewise.
+        Returns a tensor of the same shape as `x`; entries with insufficient
+        history (t < window) or NaN current value are set to NaN.
+        """
+        T = x.shape[0]
+        device = x.device
+        dtype = x.dtype
+        mask_nan = torch.isnan(x)
+        x_c = torch.where(mask_nan, torch.zeros_like(x), x)
+        one = (~mask_nan).to(dtype)
+
+        zero = torch.zeros(1, device=device, dtype=dtype)
+        cum_x  = torch.cat([zero, torch.cumsum(x_c, dim=0)])
+        cum_x2 = torch.cat([zero, torch.cumsum(x_c * x_c, dim=0)])
+        cum_n  = torch.cat([zero, torch.cumsum(one, dim=0)])
+
+        t_idx = torch.arange(1, T + 1, device=device)
+        lo = (t_idx - window).clamp(min=0)
+        s  = cum_x[t_idx]  - cum_x[lo]
+        s2 = cum_x2[t_idx] - cum_x2[lo]
+        n  = cum_n[t_idx]  - cum_n[lo]
+
+        n_safe = n.clamp(min=1.0)
+        mu = s / n_safe
+        var = (s2 / n_safe) - mu * mu
+        var = var.clamp(min=0.0)
+        sigma = torch.sqrt(var)
+
+        z = (x - mu) / (sigma + eps)
+        insufficient = n < window
+        invalid = insufficient | mask_nan
+        z = torch.where(invalid, torch.full_like(z, float('nan')), z)
+        return z
+
+    def calc_single_reward_components(
+        self,
+        expr: Expression,
+        holding_bars: int = 100,
+        execution_delay: int = 1,
+        lookback_bars: int = 1200,
+        turnover_cost: float = 0.0006,
+    ) -> Optional[Dict[str, float]]:
+        """Compute per-image reward primitives for a single factor.
+
+        Formulas:
+            z_t = (x_t - mu_t) / (sigma_t + eps),  (mu, sigma over previous `lookback_bars`)
+            p_t = clip(z_t, -3, 3) / 3
+            ret_t = mid[t + delay + H] / mid[t + delay] - 1
+            IC = rank-corr(z_t, ret_t)   (over the full training span)
+            r_t = sign(IC) * p_t * ret_t - turnover_cost * |p_t|
+            r_bar = mean(r_t)
+
+        Returns:
+            dict with keys {ic, abs_ic, r_bar, n_valid, pos_abs_mean}
+            or None if fewer than 2 valid bars.
+        """
+        if not self._single_instrument:
+            raise NotImplementedError(
+                "calc_single_reward_components is only implemented for single-instrument data."
+            )
+
+        data = self.data
+        try:
+            x_raw = expr.evaluate(data)
+        except OutOfDataRangeError:
+            return None
+        x = x_raw.squeeze(-1)  # (T,)
+        T = x.shape[0]
+        if T < lookback_bars + holding_bars + execution_delay + 2:
+            return None
+
+        # Rolling z-score and position
+        z = self._rolling_zscore_1d(x, lookback_bars)
+        p = torch.clamp(z, -3.0, 3.0) / 3.0
+
+        # Forward return via direct raw-mid indexing (avoids mutating the
+        # data-loading buffers). For each usable t, we read mid at
+        # (bt + t + delay) and (bt + t + delay + H).
+        mid_idx = int(TickFeatureType.MID)
+        mid_raw = data.data[:, mid_idx, 0]  # (n_bars_total,)
+        bt = data.max_backtrack_days
+        max_valid = mid_raw.shape[0] - 1
+
+        t_idx = torch.arange(T, device=x.device)
+        enter = bt + t_idx + execution_delay
+        exit_ = bt + t_idx + execution_delay + holding_bars
+
+        valid_idx = (enter >= 0) & (exit_ <= max_valid)
+        enter_s = enter.clamp(0, max_valid)
+        exit_s  = exit_.clamp(0, max_valid)
+        m_enter = mid_raw[enter_s]
+        m_exit  = mid_raw[exit_s]
+
+        ret = torch.where(
+            valid_idx & (m_enter > 0) & ~torch.isnan(m_enter) & ~torch.isnan(m_exit),
+            m_exit / m_enter - 1.0,
+            torch.full_like(m_enter, float('nan')),
+        )
+
+        mask = (~torch.isnan(z)) & (~torch.isnan(ret))
+        if int(mask.sum().item()) < 2:
+            return None
+
+        z_v = z[mask]
+        p_v = p[mask]
+        r_v = ret[mask]
+
+        # Rank IC of z_t vs forward return (Spearman); sign determines direction
+        ic = self._pearson_1d(self._rank_1d(z_v), self._rank_1d(r_v))
+        sign_ic = 1.0 if ic >= 0 else -1.0
+
+        # Realized per-bar pnl
+        r_t = sign_ic * p_v * r_v - turnover_cost * p_v.abs()
+        r_bar = float(r_t.mean().item())
+
+        return {
+            "ic": float(ic),
+            "abs_ic": abs(float(ic)),
+            "r_bar": r_bar,
+            "n_valid": int(mask.sum().item()),
+            "pos_abs_mean": float(p_v.abs().mean().item()),
+        }

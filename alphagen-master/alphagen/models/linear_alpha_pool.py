@@ -330,13 +330,21 @@ class MseAlphaPool(LinearAlphaPool):
 
 
 class SingleFactorAlphaPool(MseAlphaPool):
-    """Mine standalone factors with a *composite* reward.
+    """Mine standalone factors with a rolling-zscore reward.
 
-    ``reward = ic_weight * ts_ic_score + profit_weight * normalised_profit``
+    Reward formulation (matches the spec):
+        z_t     = (x_t - mu_t) / (sigma_t + eps)    # mu,sigma over prev
+                                                      # `lookback_bars` bars
+        p_t     = clip(z_t, -3, 3) / 3
+        ret_t   = mid[t + delay + H] / mid[t + delay] - 1
+        IC      = rank-corr(z_t, ret_t)             # one scalar per factor
+        r_t     = sign(IC) * p_t * ret_t - lambda * |p_t|
+        r_bar   = mean(r_t)
+        R       = alpha * tanh(|IC| / tau_ic) + beta * tanh(r_bar / tau_r)
 
-    where *ts_ic_score* is the windowed time-series IC (with optional
-    cross-window std penalty) and *normalised_profit* is the simplified
-    P&L metric ``R = mean(pos·r) − λ·mean(|Δpos|)`` divided by ``std(r)``.
+    Per-factor reward statistics (magnitude and distribution of the two tanh
+    components) are accumulated on every `try_new_expr` call and can be
+    dumped to a JSON file via ``dump_reward_stats``.
 
     Key differences from the combination pool:
     - Factors are ranked independently (no linear-combination objective).
@@ -352,64 +360,151 @@ class SingleFactorAlphaPool(MseAlphaPool):
         l1_alpha: float = 0.0,
         device: torch.device = torch.device("cpu"),
         ic_mut_threshold: Optional[float] = 0.99,
-        # ---- composite-reward knobs ----
+        # ---- reward knobs (image spec) ----
         holding_bars: int = 100,
-        bars_per_day: int = 4800,
-        window_days: int = 20,
-        ic_weight: float = 0.5,
-        profit_weight: float = 0.5,
-        use_rank_ic: bool = False,
-        turnover_penalty: float = 0.001,
-        ic_std_penalty: float = 0.0,
+        execution_delay: int = 1,
+        lookback_bars: int = 1200,
+        turnover_cost: float = 0.0006,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+        tau_ic: float = 0.05,
+        tau_r: float = 1e-3,
         trivial_penalty: float = 0.0,
     ):
         super().__init__(capacity, calculator, ic_lower_bound, l1_alpha, device)
-        self.holding_bars = holding_bars
-        self.bars_per_day = bars_per_day
-        self.window_days = window_days
-        self.ic_weight = ic_weight
-        self.profit_weight = profit_weight
-        self.use_rank_ic = use_rank_ic
-        self.turnover_penalty = turnover_penalty
-        self.ic_std_penalty = ic_std_penalty
+        self.holding_bars = int(holding_bars)
+        self.execution_delay = int(execution_delay)
+        self.lookback_bars = int(lookback_bars)
+        self.turnover_cost = float(turnover_cost)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.tau_ic = max(float(tau_ic), 1e-12)
+        self.tau_r = max(float(tau_r), 1e-12)
         self.trivial_penalty = float(trivial_penalty)
         self._ic_mut_threshold = ic_mut_threshold
         # _composite_scores mirrors single_ics but stores the composite score
         self._composite_scores: np.ndarray = np.zeros(capacity + 1)
         # _factor_directions: +1 / -1 per factor (IC sign)
         self._factor_directions: np.ndarray = np.ones(capacity + 1)
+        # Per-call reward statistics (in order of insertion)
+        self._reward_stats: Dict[str, List[float]] = {
+            "abs_ic":    [],   # |IC|
+            "r_bar":     [],   # mean per-bar pnl
+            "comp_ic":   [],   # alpha * tanh(|IC| / tau_ic)
+            "comp_r":    [],   # beta  * tanh(r_bar / tau_r)
+            "reward":    [],   # R = comp_ic + comp_r
+            "pos_abs_mean": [],
+        }
 
     # ---- scoring helpers ------------------------------------------------
 
     def _score_expr(self, expr: Expression) -> Tuple[float, float, float, float]:
-        """Return (composite, ts_ic_mean, profit_norm, direction)."""
-        ts_ic_mean, ts_ic_std = self.calculator.calc_single_ts_IC_ret(
-            expr,
-            bars_per_day=self.bars_per_day,
-            window_days=self.window_days,
-            use_rank=self.use_rank_ic,
-        )
-        profit_raw = self.calculator.calc_single_profit(
-            expr,
-            holding_bars=self.holding_bars,
-            turnover_penalty=self.turnover_penalty,
-        )
+        """Return (reward, ic_signed, r_bar, direction).
 
-        # Scheme-B: evaluate BOTH directions symmetrically and pick the better one.
-        ic_penalty = self.ic_std_penalty * ts_ic_std
-        score_pos = (
-            self.ic_weight * max(ts_ic_mean - ic_penalty, 0.0)
-            + self.profit_weight * max(profit_raw, 0.0)
-        )
-        score_neg = (
-            self.ic_weight * max(-ts_ic_mean - ic_penalty, 0.0)
-            + self.profit_weight * max(-profit_raw, 0.0)
-        )
-        if score_pos >= score_neg:
-            direction, composite = 1.0, score_pos
-        else:
-            direction, composite = -1.0, score_neg
-        return composite, ts_ic_mean, profit_raw, direction
+        When reward components cannot be computed the call returns a zero
+        reward, zero IC/r_bar and direction = +1 (treated as a skip).
+        """
+        try:
+            parts = self.calculator.calc_single_reward_components(
+                expr,
+                holding_bars=self.holding_bars,
+                execution_delay=self.execution_delay,
+                lookback_bars=self.lookback_bars,
+                turnover_cost=self.turnover_cost,
+            )
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Calculator is missing `calc_single_reward_components`; the "
+                "single-factor reward requires a TickCalculator-compatible "
+                "instance."
+            ) from exc
+        if parts is None:
+            return 0.0, 0.0, 0.0, 1.0
+
+        ic = parts["ic"]
+        abs_ic = parts["abs_ic"]
+        r_bar = parts["r_bar"]
+        pos_abs = parts.get("pos_abs_mean", 0.0)
+
+        comp_ic = self.alpha * math.tanh(abs_ic / self.tau_ic)
+        comp_r  = self.beta  * math.tanh(r_bar  / self.tau_r)
+        reward  = comp_ic + comp_r
+
+        # Direction follows sign(IC)
+        direction = 1.0 if ic >= 0 else -1.0
+
+        stats = self._reward_stats
+        stats["abs_ic"].append(float(abs_ic))
+        stats["r_bar"].append(float(r_bar))
+        stats["comp_ic"].append(float(comp_ic))
+        stats["comp_r"].append(float(comp_r))
+        stats["reward"].append(float(reward))
+        stats["pos_abs_mean"].append(float(pos_abs))
+
+        return float(reward), float(ic), float(r_bar), float(direction)
+
+    # ---- reward statistics ---------------------------------------------
+
+    def compute_reward_stats(self) -> Dict[str, Dict[str, float]]:
+        """Aggregate magnitude/distribution statistics for each component.
+
+        Returns a mapping ``name -> {count, mean, std, abs_mean, min, max,
+        p05, p25, p50, p75, p95}`` covering both raw primitives (|IC|, r_bar)
+        and the tanh-squashed reward components (comp_ic, comp_r, reward).
+        """
+        def _summarize(arr: List[float]) -> Dict[str, float]:
+            if not arr:
+                return {"count": 0}
+            a = np.asarray(arr, dtype=np.float64)
+            return {
+                "count":     int(a.size),
+                "mean":      float(a.mean()),
+                "std":       float(a.std()),
+                "abs_mean":  float(np.abs(a).mean()),
+                "min":       float(a.min()),
+                "max":       float(a.max()),
+                "p05":       float(np.quantile(a, 0.05)),
+                "p25":       float(np.quantile(a, 0.25)),
+                "p50":       float(np.quantile(a, 0.50)),
+                "p75":       float(np.quantile(a, 0.75)),
+                "p95":       float(np.quantile(a, 0.95)),
+            }
+        return {k: _summarize(v) for k, v in self._reward_stats.items()}
+
+    def dump_reward_stats(
+        self, path: str, include_raw: bool = False,
+    ) -> Dict[str, Dict[str, float]]:
+        """Write accumulated reward-component statistics to a JSON file.
+
+        When ``include_raw`` is True the per-call arrays are stored alongside
+        the summary, which is useful for plotting distributions later.
+        """
+        import json
+        import os
+        summary = self.compute_reward_stats()
+        payload: Dict[str, Any] = {
+            "config": {
+                "alpha":            self.alpha,
+                "beta":             self.beta,
+                "tau_ic":           self.tau_ic,
+                "tau_r":            self.tau_r,
+                "holding_bars":     self.holding_bars,
+                "execution_delay":  self.execution_delay,
+                "lookback_bars":    self.lookback_bars,
+                "turnover_cost":    self.turnover_cost,
+            },
+            "summary": summary,
+        }
+        if include_raw:
+            payload["raw"] = {k: list(v) for k, v in self._reward_stats.items()}
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        return summary
+
+    def reset_reward_stats(self) -> None:
+        for k in self._reward_stats:
+            self._reward_stats[k] = []
 
     # ---- overrides ------------------------------------------------------
 
