@@ -8,7 +8,7 @@ import torch
 
 from .alpha_pool import AlphaPoolBase
 from ..data.calculator import AlphaCalculator, TensorAlphaCalculator
-from ..data.expression import Expression, OutOfDataRangeError
+from ..data.expression import Expression, OutOfDataRangeError, is_trivial_expr
 from ..data.pool_update import PoolUpdate, AddRemoveAlphas
 from ..utils.correlation import batch_pearsonr
 
@@ -361,6 +361,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
         use_rank_ic: bool = False,
         turnover_penalty: float = 0.001,
         ic_std_penalty: float = 0.0,
+        trivial_penalty: float = 0.0,
     ):
         super().__init__(capacity, calculator, ic_lower_bound, l1_alpha, device)
         self.holding_bars = holding_bars
@@ -371,6 +372,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
         self.use_rank_ic = use_rank_ic
         self.turnover_penalty = turnover_penalty
         self.ic_std_penalty = ic_std_penalty
+        self.trivial_penalty = float(trivial_penalty)
         self._ic_mut_threshold = ic_mut_threshold
         # _composite_scores mirrors single_ics but stores the composite score
         self._composite_scores: np.ndarray = np.zeros(capacity + 1)
@@ -392,13 +394,21 @@ class SingleFactorAlphaPool(MseAlphaPool):
             holding_bars=self.holding_bars,
             turnover_penalty=self.turnover_penalty,
         )
-        direction = 1.0 if ts_ic_mean >= 0 else -1.0
-        ic_score = abs(ts_ic_mean) - self.ic_std_penalty * ts_ic_std
-        profit_directed = profit_raw * direction
-        composite = (
-            self.ic_weight * max(ic_score, 0.0)
-            + self.profit_weight * max(profit_directed, 0.0)
+
+        # Scheme-B: evaluate BOTH directions symmetrically and pick the better one.
+        ic_penalty = self.ic_std_penalty * ts_ic_std
+        score_pos = (
+            self.ic_weight * max(ts_ic_mean - ic_penalty, 0.0)
+            + self.profit_weight * max(profit_raw, 0.0)
         )
+        score_neg = (
+            self.ic_weight * max(-ts_ic_mean - ic_penalty, 0.0)
+            + self.profit_weight * max(-profit_raw, 0.0)
+        )
+        if score_pos >= score_neg:
+            direction, composite = 1.0, score_pos
+        else:
+            direction, composite = -1.0, score_neg
         return composite, ts_ic_mean, profit_raw, direction
 
     # ---- overrides ------------------------------------------------------
@@ -527,6 +537,8 @@ class SingleFactorAlphaPool(MseAlphaPool):
         for expr in exprs:
             if self.size >= self.capacity:
                 break
+            if self.trivial_penalty > 0.0 and is_trivial_expr(expr):
+                continue
             try:
                 ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=self._ic_mut_threshold)
             except (OutOfDataRangeError, TypeError):
@@ -559,6 +571,11 @@ class SingleFactorAlphaPool(MseAlphaPool):
         ))
 
     def try_new_expr(self, expr: Expression) -> float:
+        # Reject "single feature + constant" trivial expressions: no rolling,
+        # at most one feature leaf. Returns a negative reward and skips pool insertion.
+        if self.trivial_penalty > 0.0 and is_trivial_expr(expr):
+            return -self.trivial_penalty
+
         # Quick IC filter (cheap)
         ic_ret, ic_mut = self._calc_ics(expr, ic_mut_threshold=self._ic_mut_threshold)
         if ic_ret is None or ic_mut is None or np.isnan(ic_ret):
