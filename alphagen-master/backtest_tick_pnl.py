@@ -404,15 +404,23 @@ def eval_training_reward(
     period (per-bar overlapping evaluation), so they can be compared
     head-to-head with `reward_component_stats.json` from training.
 
-    Returns a dict::
-        {ic, abs_ic, r_bar, n_valid, pos_abs_mean,
-         comp_ic, comp_r}     (last two require alpha/beta/tau, omitted here)
+    The `direction` arg is a pass-through (e.g. the weight sign from a
+    deployed pool) and has no mathematical effect on the returned values
+    because the training formula applies sign(IC) internally.
+
+    Returns::
+        {ic, abs_ic, r_bar, r_bar_signal, r_bar_cost,
+         n_valid, pos_abs_mean}
+    where ``r_bar = r_bar_signal - r_bar_cost``.
     """
     s = pd.Series(signal, dtype=np.float64).ffill().fillna(0.0)
     n = len(s)
     if n < lookback_bars + holding_bars + execution_delay + 2:
-        return {"ic": 0.0, "abs_ic": 0.0, "r_bar": 0.0,
-                "n_valid": 0, "pos_abs_mean": 0.0}
+        return {
+            "ic": 0.0, "abs_ic": 0.0,
+            "r_bar": 0.0, "r_bar_signal": 0.0, "r_bar_cost": 0.0,
+            "n_valid": 0, "pos_abs_mean": 0.0,
+        }
 
     mu = s.rolling(lookback_bars, min_periods=lookback_bars).mean().to_numpy()
     sg = s.rolling(lookback_bars, min_periods=lookback_bars).std(ddof=0).to_numpy()
@@ -436,22 +444,28 @@ def eval_training_reward(
     mask = ~np.isnan(z) & ~np.isnan(ret) & ~np.isnan(p)
     n_valid = int(mask.sum())
     if n_valid < 2:
-        return {"ic": 0.0, "abs_ic": 0.0, "r_bar": 0.0,
-                "n_valid": 0, "pos_abs_mean": 0.0}
+        return {
+            "ic": 0.0, "abs_ic": 0.0,
+            "r_bar": 0.0, "r_bar_signal": 0.0, "r_bar_cost": 0.0,
+            "n_valid": 0, "pos_abs_mean": 0.0,
+        }
 
     z_v, p_v, r_v = z[mask], p[mask], ret[mask]
     ic = _safe_corr(_rank_1d(z_v), _rank_1d(r_v))
-    sign_ic = 1.0 if (direction * ic) >= 0 else -1.0
-    # Apply external direction (e.g. weight sign from final_pool.json) on top
-    # of the IC sign convention so this matches what the deployed strategy does.
-    sign_ic *= float(np.sign(direction)) if direction != 0 else 1.0
-    r_t = sign_ic * p_v * r_v - turnover_cost * np.abs(p_v)
+    sign_ic = 1.0 if ic >= 0 else -1.0
+    # Note: direction is informational only; the training formula uses sign(IC).
+    _ = direction
+
+    r_signal = float((sign_ic * p_v * r_v).mean())
+    r_cost   = float((turnover_cost * np.abs(p_v)).mean())
     return {
-        "ic":           float(ic),
-        "abs_ic":       abs(float(ic)),
-        "r_bar":        float(r_t.mean()),
-        "n_valid":      n_valid,
-        "pos_abs_mean": float(np.abs(p_v).mean()),
+        "ic":             float(ic),
+        "abs_ic":         abs(float(ic)),
+        "r_bar":          r_signal - r_cost,
+        "r_bar_signal":   r_signal,
+        "r_bar_cost":     r_cost,
+        "n_valid":        n_valid,
+        "pos_abs_mean":   float(np.abs(p_v).mean()),
     }
 
 
@@ -817,7 +831,8 @@ def main():
     header = (
         f"{'Factor':<28} {'Dir':>4} {'Sharpe':>7} {'AnnRet%':>8} "
         f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} "
-        f"{'WinRate':>8} {'AvgPPT':>10}  | train_|IC|  r̄(train)"
+        f"{'WinRate':>8} {'AvgPPT':>10}  | train-reward diagnostic "
+        f"(|IC|, r̄_signal, r̄_cost, |p|)"
     )
 
     def print_header():
@@ -892,10 +907,12 @@ def main():
             turnover_cost=args.turnover_cost,
             direction=direction,
         )
-        res["train_abs_ic"] = train_reward["abs_ic"]
-        res["train_r_bar"]  = train_reward["r_bar"]
+        res["train_abs_ic"]      = train_reward["abs_ic"]
+        res["train_r_bar"]       = train_reward["r_bar"]
+        res["train_r_bar_signal"] = train_reward["r_bar_signal"]
+        res["train_r_bar_cost"]   = train_reward["r_bar_cost"]
         res["train_pos_abs_mean"] = train_reward["pos_abs_mean"]
-        res["train_n_valid"] = train_reward["n_valid"]
+        res["train_n_valid"]      = train_reward["n_valid"]
         all_results.append(res)
 
         avg_ppt = res.get('avg_profit_per_trade', float('nan'))
@@ -910,7 +927,9 @@ def main():
             f"{res['win_rate']*100:>7.1f}% "
             f"{avg_ppt*1e4:>9.2f}bps  "
             f"| train_|IC|={train_reward['abs_ic']:.4f} "
-            f"r̄={train_reward['r_bar']:.3e}"
+            f"r̄_sig={train_reward['r_bar_signal']:+.2e} "
+            f"r̄_cost={train_reward['r_bar_cost']:.2e} "
+            f"|p|={train_reward['pos_abs_mean']:.2f}"
         )
 
     # ── Optional per-factor diagnostic (only in ensemble mode) ────────────
@@ -1017,10 +1036,14 @@ def main():
     # ── Training-reward summary (compare with training stats) ─────────────
     train_abs_ic = np.array([r.get("train_abs_ic", np.nan) for r in all_results],
                             dtype=np.float64)
-    train_r_bar  = np.array([r.get("train_r_bar",  np.nan) for r in all_results],
-                            dtype=np.float64)
-    train_pos_abs = np.array([r.get("train_pos_abs_mean", np.nan) for r in all_results],
-                             dtype=np.float64)
+    train_r_bar       = np.array([r.get("train_r_bar",        np.nan) for r in all_results],
+                                 dtype=np.float64)
+    train_r_bar_sig   = np.array([r.get("train_r_bar_signal", np.nan) for r in all_results],
+                                 dtype=np.float64)
+    train_r_bar_cost  = np.array([r.get("train_r_bar_cost",   np.nan) for r in all_results],
+                                 dtype=np.float64)
+    train_pos_abs     = np.array([r.get("train_pos_abs_mean", np.nan) for r in all_results],
+                                 dtype=np.float64)
     if np.isfinite(train_abs_ic).any():
         print(
             f"\nTraining-reward diagnostic over backtest period "
@@ -1028,22 +1051,38 @@ def main():
             f"lambda={args.turnover_cost}):"
         )
         print(
-            f"  |IC|     mean={np.nanmean(train_abs_ic):.4f}  "
+            f"  |IC|        mean={np.nanmean(train_abs_ic):.4f}  "
             f"p50={np.nanmedian(train_abs_ic):.4f}  "
             f"max={np.nanmax(train_abs_ic):.4f}"
         )
         print(
-            f"  r_bar    mean={np.nanmean(train_r_bar):.3e}  "
-            f"p50={np.nanmedian(train_r_bar):.3e}  "
-            f"max={np.nanmax(train_r_bar):.3e}"
+            f"  r̄_signal    mean={np.nanmean(train_r_bar_sig):+.3e}  "
+            f"p50={np.nanmedian(train_r_bar_sig):+.3e}  "
+            f"max={np.nanmax(train_r_bar_sig):+.3e}"
         )
         print(
-            f"  |p|_mean mean={np.nanmean(train_pos_abs):.3f}  "
+            f"  r̄_cost      mean={np.nanmean(train_r_bar_cost):.3e}  "
+            f"p50={np.nanmedian(train_r_bar_cost):.3e}  "
+            f"max={np.nanmax(train_r_bar_cost):.3e}"
+        )
+        print(
+            f"  r̄ = sig-cost mean={np.nanmean(train_r_bar):+.3e}  "
+            f"p50={np.nanmedian(train_r_bar):+.3e}  "
+            f"max={np.nanmax(train_r_bar):+.3e}"
+        )
+        print(
+            f"  |p|_mean    mean={np.nanmean(train_pos_abs):.3f}  "
             f"max={np.nanmax(train_pos_abs):.3f}"
         )
         print(
-            "  Compare these against `reward_component_stats.json` from the "
-            "training window to diagnose train→test degradation."
+            "  Notes:\n"
+            "  - r̄_signal = mean(sign(IC)·p·ret), r̄_cost = lambda·mean(|p|).\n"
+            "  - r̄ negative does NOT mean the backtest lost money; it means\n"
+            "    lambda·|p| > signal at this IC level. Backtest P&L uses\n"
+            "    --cost_bps (0 by default), not lambda.\n"
+            "  - For |IC|≈0.03 on 5-min holding, signal ~ |IC|·std(p)·std(ret)\n"
+            "    is O(1e-6); with lambda=0.0006 and |p|≈0.3, cost is O(1e-4).\n"
+            "    That's why r̄ is structurally negative for weak factors."
         )
 
     # ── Plot ──────────────────────────────────────────────────────────────
