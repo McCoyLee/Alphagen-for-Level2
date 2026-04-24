@@ -162,6 +162,8 @@ def load_factors(path: str):
  
 # ── Backtest parameters ───────────────────────────────────────────────────────
 DEFAULT_HOLDING_BARS = 100  # match training target: Ref(mid_prc,-100)/mid_prc-1
+DEFAULT_LOOKBACK_BARS = 1200  # match training: sf_lookback_bars (z-score window)
+DEFAULT_TURNOVER_COST = 0.0006  # match training: sf_turnover_cost (lambda in r_t)
 COST_BPS = 0               # round-trip cost per trade (ETF single-side 2.5 bps)
  
  
@@ -186,25 +188,36 @@ def simulate_pnl(
     holding_bars: int = DEFAULT_HOLDING_BARS,
     cost_bps: float = COST_BPS,
     execution_delay: int = 1,
+    lookback_bars: int = DEFAULT_LOOKBACK_BARS,
+    dead_zone: float = 0.05,
 ) -> dict:
     """
     Non-overlapping trades aligned to `holding_bars` horizon.
- 
+
     At each trade entry `t`:
-      - signal_zscore = rolling zscore of signal up to t (lookback = holding_bars)
-      - position = clamp(zscore * direction, -1, 1)
+      - signal_zscore = rolling zscore of signal over the *previous*
+        ``lookback_bars`` bars (continuous across days, matching
+        ``calc_single_reward_components`` in training)
+      - position = clamp(zscore * direction, -1, 1) / 3 (matches training)
       - hold until t + holding_bars (or end of day, whichever first)
       - trade_ret = mid_prc[exit] / mid_prc[entry] - 1
       - trade_pnl = position * trade_ret - |position| * cost_bps * 1e-4
+
+    Notes:
+    - The z-score uses a *continuous global* rolling window (does not reset
+      at day boundaries), exactly like the training reward formula, instead
+      of resetting every morning.
+    - Trades are not opened until the global rolling window has filled
+      (first ``lookback_bars`` bars of the entire series).
     """
     n = len(signal)
     cost_frac = cost_bps * 1e-4
- 
+
     trades = []     # list of {entry, exit, pos, ret, pnl}
- 
+
     # ── Walk through days, doing non-overlapping intraday trades ─────────
     day_starts = list(range(0, n, bars_per_day))
- 
+
     # ── Pre-process signal: forward-fill NaN then fill remaining with 0 ──
     # Rolling operators (Mad, WMA, etc.) propagate NaN across windows when
     # the underlying feature has missing bars (no ticks). Forward-filling
@@ -213,20 +226,23 @@ def simulate_pnl(
     signal_series = pd.Series(signal, dtype=np.float64)
     signal_series = signal_series.ffill().fillna(0.0)
     signal_clean = signal_series.to_numpy()
- 
-    # Rolling z-score state
-    zscore_window = 600  # fixed z-score lookback per training setup
+
+    # Rolling z-score state — continuous across day boundaries (matches the
+    # training reward formula `(x_t - mu_t) / (sigma_t + eps)` with mu/sigma
+    # over the previous `lookback_bars` bars).
+    zscore_window = max(int(lookback_bars), 2)
     z_mean = signal_series.rolling(
-        zscore_window, min_periods=max(zscore_window // 2, 1)
+        zscore_window, min_periods=zscore_window
     ).mean().to_numpy()
     z_std = signal_series.rolling(
-        zscore_window, min_periods=max(zscore_window // 2, 1)
+        zscore_window, min_periods=zscore_window
     ).std(ddof=0).to_numpy()
- 
+
     for day_idx, day_start in enumerate(day_starts):
         day_end = min(day_start + bars_per_day, n)
- 
-        t = day_start + zscore_window  # skip warm-up within day
+
+        # Global warmup: don't trade before the rolling window is full.
+        t = max(day_start, zscore_window)
         while t + execution_delay + holding_bars <= day_end:
             # ── Compute position using signal z-score at entry ────────
             std_val = z_std[t]
@@ -241,8 +257,8 @@ def simulate_pnl(
                 continue
             z = np.clip(z, -3.0, 3.0) / 3.0  # normalize to [-1, 1]
             pos = z * direction
- 
-            if abs(pos) < 0.05:     # dead zone: skip negligible positions
+
+            if abs(pos) < dead_zone:     # dead zone: skip negligible positions
                 t += holding_bars
                 continue
  
@@ -346,6 +362,96 @@ def simulate_pnl(
         "n_full_days": len(daily_pnl),
         "win_rate": win_rate,
         "avg_profit_per_trade": avg_profit_per_trade,
+    }
+
+
+def _rank_1d(x: np.ndarray) -> np.ndarray:
+    """Average-rank with NaN handling (matches scipy.rankdata 'average')."""
+    valid = ~np.isnan(x)
+    out = np.full_like(x, np.nan, dtype=np.float64)
+    if valid.sum() <= 1:
+        return out
+    xv = x[valid]
+    order = np.argsort(xv)
+    ranks = np.empty_like(xv, dtype=np.float64)
+    ranks[order] = np.arange(len(xv), dtype=np.float64)
+    out[valid] = ranks
+    return out
+
+
+def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
+    mask = ~np.isnan(x) & ~np.isnan(y)
+    if mask.sum() < 2:
+        return 0.0
+    xv = x[mask] - x[mask].mean()
+    yv = y[mask] - y[mask].mean()
+    denom = np.sqrt((xv * xv).sum() * (yv * yv).sum())
+    return 0.0 if denom < 1e-12 else float((xv * yv).sum() / denom)
+
+
+def eval_training_reward(
+    signal: np.ndarray,
+    mid_prc: np.ndarray,
+    holding_bars: int,
+    execution_delay: int,
+    lookback_bars: int,
+    turnover_cost: float,
+    direction: float = 1.0,
+) -> dict:
+    """Replicate `TickCalculator.calc_single_reward_components` on raw arrays.
+
+    Computes the *training* reward primitives over the entire backtest
+    period (per-bar overlapping evaluation), so they can be compared
+    head-to-head with `reward_component_stats.json` from training.
+
+    Returns a dict::
+        {ic, abs_ic, r_bar, n_valid, pos_abs_mean,
+         comp_ic, comp_r}     (last two require alpha/beta/tau, omitted here)
+    """
+    s = pd.Series(signal, dtype=np.float64).ffill().fillna(0.0)
+    n = len(s)
+    if n < lookback_bars + holding_bars + execution_delay + 2:
+        return {"ic": 0.0, "abs_ic": 0.0, "r_bar": 0.0,
+                "n_valid": 0, "pos_abs_mean": 0.0}
+
+    mu = s.rolling(lookback_bars, min_periods=lookback_bars).mean().to_numpy()
+    sg = s.rolling(lookback_bars, min_periods=lookback_bars).std(ddof=0).to_numpy()
+    eps = 1e-8
+    z = (s.to_numpy() - mu) / (sg + eps)
+    z[~np.isfinite(z)] = np.nan
+    p = np.clip(z, -3.0, 3.0) / 3.0
+
+    # Forward return: mid[t + delay + H] / mid[t + delay] - 1
+    enter = np.arange(n) + execution_delay
+    exit_ = enter + holding_bars
+    valid_idx = (enter >= 0) & (exit_ < n)
+    enter_s = np.clip(enter, 0, n - 1)
+    exit_s  = np.clip(exit_,  0, n - 1)
+    m_e = mid_prc[enter_s]
+    m_x = mid_prc[exit_s]
+    ret = np.full(n, np.nan, dtype=np.float64)
+    ok = valid_idx & (m_e > 0) & ~np.isnan(m_e) & ~np.isnan(m_x)
+    ret[ok] = m_x[ok] / m_e[ok] - 1.0
+
+    mask = ~np.isnan(z) & ~np.isnan(ret) & ~np.isnan(p)
+    n_valid = int(mask.sum())
+    if n_valid < 2:
+        return {"ic": 0.0, "abs_ic": 0.0, "r_bar": 0.0,
+                "n_valid": 0, "pos_abs_mean": 0.0}
+
+    z_v, p_v, r_v = z[mask], p[mask], ret[mask]
+    ic = _safe_corr(_rank_1d(z_v), _rank_1d(r_v))
+    sign_ic = 1.0 if (direction * ic) >= 0 else -1.0
+    # Apply external direction (e.g. weight sign from final_pool.json) on top
+    # of the IC sign convention so this matches what the deployed strategy does.
+    sign_ic *= float(np.sign(direction)) if direction != 0 else 1.0
+    r_t = sign_ic * p_v * r_v - turnover_cost * np.abs(p_v)
+    return {
+        "ic":           float(ic),
+        "abs_ic":       abs(float(ic)),
+        "r_bar":        float(r_t.mean()),
+        "n_valid":      n_valid,
+        "pos_abs_mean": float(np.abs(p_v).mean()),
     }
 
 
@@ -588,6 +694,17 @@ def main():
     ap.add_argument("--execution_delay", type=int, default=1,
                         help="Bars between signal observation and trade entry "
                             "(default=1: realistic; 0: same-bar fill, inflates perf ")
+    ap.add_argument("--lookback_bars", type=int, default=DEFAULT_LOOKBACK_BARS,
+                    help="Rolling z-score window in bars (default=1200, "
+                         "matches training's --sf_lookback_bars).")
+    ap.add_argument("--turnover_cost", type=float, default=DEFAULT_TURNOVER_COST,
+                    help="lambda used by the training-style r_bar metric "
+                         "(default=0.0006, matches training's --sf_turnover_cost). "
+                         "This is a DIAGNOSTIC overlay; --cost_bps still drives "
+                         "the executed P&L.")
+    ap.add_argument("--dead_zone", type=float, default=0.05,
+                    help="Skip trades whose normalized position |p|<dead_zone "
+                         "(default=0.05). Set 0 to match training (no dead zone).")
     ap.add_argument(
         "--factor_ic_mode",
         choices=["intraday", "train_compatible"],
@@ -635,7 +752,11 @@ def main():
     print(f"Device: {device}")
     print(f"Holding period: {args.holding_bars} bars "
           f"({args.holding_bars * 3 / 60:.0f} min)")
-    print(f"Transaction cost: {args.cost_bps} bps RT")
+    print(f"Z-score lookback: {args.lookback_bars} bars  "
+          f"(training default sf_lookback_bars=1200)")
+    print(f"Transaction cost (P&L): {args.cost_bps} bps RT")
+    print(f"Training-style turnover_cost (r_bar diagnostic): {args.turnover_cost}")
+    print(f"Dead zone: |p|<{args.dead_zone}")
     print(f"Factor IC mode: {args.factor_ic_mode}")
     if args.factors_json:
         print(f"Factor source: {args.factors_json}")
@@ -696,7 +817,7 @@ def main():
     header = (
         f"{'Factor':<28} {'Dir':>4} {'Sharpe':>7} {'AnnRet%':>8} "
         f"{'MaxDD%':>8} {'IC(f)':>8} {'IC(s)':>8} {'#Trades':>8} "
-        f"{'WinRate':>8} {'AvgPPT':>10}"
+        f"{'WinRate':>8} {'AvgPPT':>10}  | train_|IC|  r̄(train)"
     )
 
     def print_header():
@@ -750,6 +871,8 @@ def main():
             holding_bars=args.holding_bars,
             cost_bps=args.cost_bps,
             execution_delay=args.execution_delay,
+            lookback_bars=args.lookback_bars,
+            dead_zone=args.dead_zone,
         )
         res["name"] = name
         res["expr"] = expr_str
@@ -757,6 +880,22 @@ def main():
         res.setdefault("strategy_ic", float("nan"))
         res["factor_ic"] = factor_ic
         res["factor_ic_n"] = ic_n
+
+        # Training-reward diagnostic (overlapping per-bar evaluation,
+        # exactly the formula the agent optimized against).
+        train_reward = eval_training_reward(
+            signal=signal_clean,
+            mid_prc=mid_prc,
+            holding_bars=args.holding_bars,
+            execution_delay=args.execution_delay,
+            lookback_bars=args.lookback_bars,
+            turnover_cost=args.turnover_cost,
+            direction=direction,
+        )
+        res["train_abs_ic"] = train_reward["abs_ic"]
+        res["train_r_bar"]  = train_reward["r_bar"]
+        res["train_pos_abs_mean"] = train_reward["pos_abs_mean"]
+        res["train_n_valid"] = train_reward["n_valid"]
         all_results.append(res)
 
         avg_ppt = res.get('avg_profit_per_trade', float('nan'))
@@ -769,7 +908,9 @@ def main():
             f"{res.get('strategy_ic', float('nan')):>8.4f} "
             f"{res['n_trades']:>8d} "
             f"{res['win_rate']*100:>7.1f}% "
-            f"{avg_ppt*1e4:>9.2f}bps"
+            f"{avg_ppt*1e4:>9.2f}bps  "
+            f"| train_|IC|={train_reward['abs_ic']:.4f} "
+            f"r̄={train_reward['r_bar']:.3e}"
         )
 
     # ── Optional per-factor diagnostic (only in ensemble mode) ────────────
@@ -868,11 +1009,43 @@ def main():
             )
 
     print("=" * len(header))
- 
+
     if not all_results:
         print("No factors evaluated successfully.")
         return
- 
+
+    # ── Training-reward summary (compare with training stats) ─────────────
+    train_abs_ic = np.array([r.get("train_abs_ic", np.nan) for r in all_results],
+                            dtype=np.float64)
+    train_r_bar  = np.array([r.get("train_r_bar",  np.nan) for r in all_results],
+                            dtype=np.float64)
+    train_pos_abs = np.array([r.get("train_pos_abs_mean", np.nan) for r in all_results],
+                             dtype=np.float64)
+    if np.isfinite(train_abs_ic).any():
+        print(
+            f"\nTraining-reward diagnostic over backtest period "
+            f"(holding={args.holding_bars}, lookback={args.lookback_bars}, "
+            f"lambda={args.turnover_cost}):"
+        )
+        print(
+            f"  |IC|     mean={np.nanmean(train_abs_ic):.4f}  "
+            f"p50={np.nanmedian(train_abs_ic):.4f}  "
+            f"max={np.nanmax(train_abs_ic):.4f}"
+        )
+        print(
+            f"  r_bar    mean={np.nanmean(train_r_bar):.3e}  "
+            f"p50={np.nanmedian(train_r_bar):.3e}  "
+            f"max={np.nanmax(train_r_bar):.3e}"
+        )
+        print(
+            f"  |p|_mean mean={np.nanmean(train_pos_abs):.3f}  "
+            f"max={np.nanmax(train_pos_abs):.3f}"
+        )
+        print(
+            "  Compare these against `reward_component_stats.json` from the "
+            "training window to diagnose train→test degradation."
+        )
+
     # ── Plot ──────────────────────────────────────────────────────────────
     plot_results(all_results, args.holding_bars, args.cost_bps, out_path=args.out)
  

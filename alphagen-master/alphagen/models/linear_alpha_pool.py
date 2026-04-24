@@ -367,7 +367,7 @@ class SingleFactorAlphaPool(MseAlphaPool):
         turnover_cost: float = 0.0006,
         alpha: float = 1.0,
         beta: float = 1.0,
-        tau_ic: float = 0.05,
+        tau_ic: float = 0.1,
         tau_r: float = 1e-3,
         trivial_penalty: float = 0.0,
     ):
