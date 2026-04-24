@@ -211,6 +211,20 @@ class TickRollingCallback(BaseCallback):
         self.logger.record('pool/eval_cnt', pool.eval_cnt)
         self.logger.record('pool/global_eval_cnt', self._global_eval_cnt)
 
+        # ---- Reward-component tensorboard metrics (single-factor mode) ----
+        if HAS_SINGLE_FACTOR_POOL and isinstance(pool, SingleFactorAlphaPool):
+            stats = pool._reward_stats
+            tail = 500  # look at the most recent evaluations to track dynamics
+            for key in ("abs_ic", "r_bar", "comp_ic", "comp_r", "reward", "pos_abs_mean"):
+                arr = stats.get(key, [])
+                if not arr:
+                    continue
+                recent = np.asarray(arr[-tail:], dtype=np.float64)
+                self.logger.record(f'reward/{key}_mean',  float(recent.mean()))
+                self.logger.record(f'reward/{key}_std',   float(recent.std()))
+                self.logger.record(f'reward/{key}_p95',   float(np.quantile(recent, 0.95)))
+                self.logger.record(f'reward/{key}_max',   float(recent.max()))
+
         valid_ic_raw, valid_rank_ic_raw = self._pool_factor_mean_ic(self.valid_calculator)
 
         n_days = sum(calc.data.n_days for calc in self.test_calculators)
@@ -561,7 +575,7 @@ def train_one_window(
     # Rolling-zscore reward knobs (SingleFactorAlphaPool, per spec)
     sf_alpha: float = 1.0,
     sf_beta: float = 1.0,
-    sf_tau_ic: float = 0.05,
+    sf_tau_ic: float = 0.1,
     sf_tau_r: float = 1e-3,
     sf_lookback_bars: int = 1200,
     sf_turnover_cost: float = 0.0006,
@@ -747,7 +761,17 @@ def train_one_window(
             forgetful=llm_forgetful,
         )
         print(f"[Window {wid}] LLM generating initial alpha pool...")
-        pool = inter.run(n_updates=llm_init_updates)
+        try:
+            pool = inter.run(n_updates=llm_init_updates)
+        except Exception as exc:  # network / 502 / parser etc.
+            print(
+                f"[Window {wid}] LLM warmstart failed ({type(exc).__name__}: "
+                f"{exc}). Falling back to seed-bootstrap pool."
+            )
+            # inter.run may have partially mutated its pool; rebuild a clean
+            # empty one so the fallback-seed block below is the single source
+            # of truth for pool contents.
+            pool = build_pool()
 
         # Fallback: if LLM init pool is too small, bootstrap with robust seed expressions
         if pool.size < llm_init_min_pool_size:
@@ -949,7 +973,7 @@ def main(
     # Rolling-zscore reward knobs (SingleFactorAlphaPool, per spec)
     sf_alpha: float = 1.0,
     sf_beta: float = 1.0,
-    sf_tau_ic: float = 0.05,
+    sf_tau_ic: float = 0.1,
     sf_tau_r: float = 1e-3,
     sf_lookback_bars: int = 1200,
     sf_turnover_cost: float = 0.0006,
