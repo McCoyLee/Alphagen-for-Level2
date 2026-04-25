@@ -36,6 +36,8 @@ Usage:
 import json
 import os
 import copy
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional, List, Union, Tuple, Dict
 from datetime import datetime
 from collections import deque, defaultdict
@@ -550,6 +552,72 @@ def build_stable_pool_from_results(
 
 
 # ---------------------------------------------------------------------------
+# Best-factor selection helper
+# ---------------------------------------------------------------------------
+
+def _select_best_factor_from_pool(
+    pool: LinearAlphaPool,
+    valid_calculator: TickCalculator,
+    test_calculator: Optional[TickCalculator] = None,
+) -> Optional[Dict[str, float]]:
+    """
+    Pick the single best factor inside ``pool`` by |valid IC| of each
+    individual expression (sign-aligned to its deployed weight). Returns
+    ``None`` if the pool is empty.
+    """
+    n = int(pool.size)
+    if n <= 0:
+        return None
+
+    rows = []
+    for i in range(n):
+        expr = pool.exprs[i]
+        if expr is None:
+            continue
+        try:
+            v_ic  = float(valid_calculator.calc_single_IC_ret(expr))
+            v_ric = float(valid_calculator.calc_single_rIC_ret(expr))
+        except Exception:
+            continue
+        w = float(pool.weights[i]) if i < len(pool.weights) else 1.0
+        direction = 1.0 if w >= 0 else -1.0
+        rows.append({
+            "idx": i,
+            "expr": str(expr),
+            "weight": w,
+            "valid_ic": v_ic * direction,
+            "valid_rank_ic": v_ric * direction,
+            "direction": direction,
+        })
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda r: abs(r["valid_ic"]), reverse=True)
+    best = rows[0]
+
+    test_ic = float("nan")
+    test_rank_ic = float("nan")
+    if test_calculator is not None:
+        try:
+            t_ic  = float(test_calculator.calc_single_IC_ret(pool.exprs[best["idx"]]))
+            t_ric = float(test_calculator.calc_single_rIC_ret(pool.exprs[best["idx"]]))
+            test_ic = t_ic * best["direction"]
+            test_rank_ic = t_ric * best["direction"]
+        except Exception:
+            pass
+
+    return {
+        "expr": best["expr"],
+        "weight": best["weight"],
+        "valid_ic": best["valid_ic"],
+        "valid_rank_ic": best["valid_rank_ic"],
+        "test_ic": test_ic,
+        "test_rank_ic": test_rank_ic,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-window training
 # ---------------------------------------------------------------------------
 
@@ -601,21 +669,42 @@ def train_one_window(
     valid_restore_cooldown: int = 3,
     # Multi-env parallelism
     n_envs: int = 1,
+    # Parallel-pool labelling (one worker per parallel pool)
+    worker_idx: int = 0,
 ) -> dict:
-    """Train one walk-forward window. Returns dict with results."""
+    """Train one walk-forward window. Returns dict with results.
+
+    When called from the parallel dispatcher, ``seed`` and ``worker_idx`` are
+    distinct per worker; outputs are written under
+    ``save_root/window_XXX/seed_<seed>/`` so that concurrent workers cannot
+    collide on file paths.
+    """
+    # Each parallel worker must reseed itself; otherwise spawned subprocesses
+    # would inherit identical RNG state and produce duplicate alpha pools.
+    reseed_everything(seed)
+
     wid = window["window_id"]
+    tag = f"[Window {wid}|seed {seed}|worker {worker_idx}]"
     print(f"\n{'='*70}")
-    print(f"[Window {wid}] "
+    print(f"{tag} "
           f"train={window['train_start']}~{window['train_end']}, "
           f"valid={window['valid_start']}~{window['valid_end']}, "
           f"test={window['test_start']}~{window['test_end']}")
     print(f"{'='*70}")
 
     window_dir = os.path.join(save_root, f"window_{wid:03d}")
-    os.makedirs(window_dir, exist_ok=True)
+    worker_dir = os.path.join(window_dir, f"seed_{seed:03d}")
+    os.makedirs(worker_dir, exist_ok=True)
 
-    with open(os.path.join(window_dir, "window_meta.json"), "w") as f:
-        json.dump(window, f, indent=2)
+    # window_meta is window-scoped (identical across workers); write once.
+    meta_path = os.path.join(window_dir, "window_meta.json")
+    if not os.path.exists(meta_path):
+        try:
+            with open(meta_path, "w") as f:
+                json.dump(window, f, indent=2)
+        except OSError:
+            # Two workers raced; the loser silently skips — content is identical.
+            pass
 
     mid_prc = Feature(TickFeatureType.MID)
     target = Ref(mid_prc, -max_future_bars) / mid_prc - 1
@@ -745,7 +834,7 @@ def train_one_window(
     if llm_warmstart or use_llm:
         print(f"[Window {wid}] Setting up LLM client...")
         chat_client = build_tick_chat_client(
-            log_dir=window_dir,
+            log_dir=worker_dir,
             base_url=llm_base_url,
             api_key=llm_api_key,
             model=llm_model,
@@ -823,9 +912,9 @@ def train_one_window(
             print_expr=True,
         )
 
-    conv_logger = ConvergenceLogger(save_dir=window_dir)
+    conv_logger = ConvergenceLogger(save_dir=worker_dir)
     callback = TickRollingCallback(
-        save_path=window_dir,
+        save_path=worker_dir,
         valid_calculator=calculators[1],
         test_calculators=calculators[2:],
         verbose=1,
@@ -863,15 +952,15 @@ def train_one_window(
         verbose=1,
     )
 
-    print(f"[Window {wid}] Training for {steps} steps...")
+    print(f"{tag} Training for {steps} steps...")
     model.learn(
         total_timesteps=steps,
         callback=callback,
-        tb_log_name=f"window_{wid:03d}",
+        tb_log_name=f"window_{wid:03d}_seed{seed:03d}",
     )
 
     # Save final pool
-    final_pool_path = os.path.join(window_dir, "final_pool.json")
+    final_pool_path = os.path.join(worker_dir, "final_pool.json")
     pool_dict = pool.to_json_dict()
     if single_factor_mode:
         bad = [w for w in pool_dict["weights"] if abs(abs(w) - 1.0) > 1e-6]
@@ -895,7 +984,7 @@ def train_one_window(
     # Dump reward-component magnitude & distribution stats (single-factor mode)
     reward_stats_summary: Optional[Dict[str, Dict[str, float]]] = None
     if single_factor_mode and hasattr(pool, "dump_reward_stats"):
-        stats_path = os.path.join(window_dir, "reward_component_stats.json")
+        stats_path = os.path.join(worker_dir, "reward_component_stats.json")
         try:
             reward_stats_summary = pool.dump_reward_stats(stats_path, include_raw=True)
             comp_ic = reward_stats_summary.get("comp_ic", {})
@@ -903,7 +992,7 @@ def train_one_window(
             abs_ic  = reward_stats_summary.get("abs_ic",  {})
             r_bar   = reward_stats_summary.get("r_bar",   {})
             print(
-                f"[Window {wid}] Reward-component stats (n={comp_ic.get('count', 0)}):\n"
+                f"{tag} Reward-component stats (n={comp_ic.get('count', 0)}):\n"
                 f"  |IC|       mean={abs_ic.get('mean', 0):.4f}  std={abs_ic.get('std', 0):.4f}  "
                 f"p50={abs_ic.get('p50', 0):.4f}  max={abs_ic.get('max', 0):.4f}\n"
                 f"  r_bar      mean={r_bar.get('mean', 0):.3e}  std={r_bar.get('std', 0):.3e}  "
@@ -914,13 +1003,43 @@ def train_one_window(
                 f"max={comp_r.get('max', 0):.4f}"
             )
         except Exception as exc:  # pragma: no cover
-            print(f"[Window {wid}] Failed to dump reward stats: {exc}")
+            print(f"{tag} Failed to dump reward stats: {exc}")
 
     valid_ic, valid_rank_ic = pool.test_ensemble(calculators[1])
     test_ic, test_rank_ic = pool.test_ensemble(calculators[2])
 
+    # ---- Per-worker best factor: pick top-1 expr by |valid IC| ----
+    best_factor = _select_best_factor_from_pool(
+        pool=pool,
+        valid_calculator=calculators[1],
+        test_calculator=calculators[2],
+    )
+    best_factor_path = os.path.join(worker_dir, "best_factor.json")
+    payload = {
+        "window_id": wid,
+        "seed": seed,
+        "worker_idx": worker_idx,
+        "best": best_factor,
+    }
+    with open(best_factor_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    if best_factor is not None:
+        print(
+            f"{tag} BEST FACTOR: {best_factor['expr']}\n"
+            f"  weight={best_factor['weight']:+.4f}  "
+            f"valid_IC={best_factor['valid_ic']:+.4f}  "
+            f"valid_RankIC={best_factor['valid_rank_ic']:+.4f}  "
+            f"test_IC={best_factor['test_ic']:+.4f}  "
+            f"test_RankIC={best_factor['test_rank_ic']:+.4f}"
+        )
+    else:
+        print(f"{tag} BEST FACTOR: <pool empty>")
+
     result = {
         "window_id": wid,
+        "seed": seed,
+        "worker_idx": worker_idx,
         **window,
         "valid_ic": float(valid_ic),
         "valid_rank_ic": float(valid_rank_ic),
@@ -928,6 +1047,9 @@ def train_one_window(
         "test_rank_ic": float(test_rank_ic),
         "pool_size": int(pool.size),
         "pool_path": final_pool_path,
+        "worker_dir": worker_dir,
+        "best_factor": best_factor,
+        "best_factor_path": best_factor_path,
     }
     if reward_stats_summary is not None:
         result["reward_stats"] = reward_stats_summary
@@ -936,8 +1058,205 @@ def train_one_window(
     if summary:
         result["best_pool_ic"] = summary.get("best_pool_ic", 0.0)
 
-    print(f"[Window {wid}] Done: valid_ic={valid_ic:.4f}, test_ic={test_ic:.4f}")
+    print(f"{tag} Done: valid_ic={valid_ic:.4f}, test_ic={test_ic:.4f}")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Parallel dispatch: N workers per window (each its own pool / seed)
+# ---------------------------------------------------------------------------
+
+def _train_window_worker_entry(kwargs: dict) -> dict:
+    """Top-level entrypoint executed inside each spawned subprocess.
+
+    Must be importable / picklable, hence kept at module scope.
+    """
+    # Re-import in the child to make sure CUDA gets initialised lazily.
+    return train_one_window(**kwargs)
+
+
+def _warm_data_cache(
+    window: dict,
+    instruments: Union[str, List[str]],
+    features: List[TickFeatureType],
+    bar_size_sec: int,
+    max_backtrack_bars: int,
+    max_future_bars: int,
+    data_root: str,
+    cache_dir: Optional[str],
+    max_workers: int,
+) -> None:
+    """
+    Touch each train/valid/test segment serially in the parent so the on-disk
+    cache is populated before parallel workers race to write it. Datasets are
+    discarded immediately to free memory; child workers will reload from the
+    warm cache.
+    """
+    if cache_dir is None:
+        return
+    print(f"[Window {window['window_id']}] Pre-warming data cache ({cache_dir})...")
+    cpu_dev = torch.device("cpu")
+    for label, (start, end) in zip(
+        ["train", "valid", "test"],
+        [
+            (window["train_start"], window["train_end"]),
+            (window["valid_start"], window["valid_end"]),
+            (window["test_start"], window["test_end"]),
+        ],
+    ):
+        try:
+            tmp = TickStockData(
+                instrument=instruments,
+                start_time=start,
+                end_time=end,
+                max_backtrack_days=max_backtrack_bars,
+                max_future_days=max_future_bars,
+                features=features,
+                device=cpu_dev,
+                data_root=data_root,
+                cache_dir=cache_dir,
+                max_workers=max_workers,
+                bar_size_sec=bar_size_sec,
+            )
+            print(f"  {label}: {start}~{end} cached ({tmp.n_days} bars)")
+            del tmp
+        except Exception as exc:
+            print(f"  {label}: cache warm-up failed ({type(exc).__name__}: {exc}); "
+                  f"workers will fall back to on-the-fly load.")
+
+
+def train_window_parallel(
+    window: dict,
+    seeds: List[int],
+    prev_pool_paths: Dict[int, Optional[str]],
+    shared_kwargs: dict,
+    n_parallel_pools: int,
+) -> List[dict]:
+    """
+    Run N independent ``train_one_window`` workers concurrently.
+
+    Each worker uses its own seed and its own per-seed warm-start pool. The
+    function blocks until every worker finishes, then returns the list of
+    per-worker result dicts (sorted by ``worker_idx``).
+    """
+    wid = window["window_id"]
+    n_workers = len(seeds)
+    assert n_workers == n_parallel_pools, \
+        f"seeds count ({n_workers}) != n_parallel_pools ({n_parallel_pools})"
+
+    # Build one full kwargs dict per worker.
+    worker_kwargs_list: List[dict] = []
+    for worker_idx, seed in enumerate(seeds):
+        kw = dict(shared_kwargs)
+        kw["window"] = window
+        kw["seed"] = seed
+        kw["worker_idx"] = worker_idx
+        kw["prev_pool_path"] = prev_pool_paths.get(worker_idx)
+        worker_kwargs_list.append(kw)
+
+    if n_workers == 1:
+        # Single-pool fast path: skip the subprocess overhead entirely.
+        return [_train_window_worker_entry(worker_kwargs_list[0])]
+
+    print(f"\n[Window {wid}] Launching {n_workers} parallel pool workers "
+          f"with seeds {seeds} (shared GPU)")
+
+    # 'spawn' is required for CUDA — 'fork' would inherit a poisoned CUDA
+    # context from the parent and deadlock.
+    ctx = mp.get_context("spawn")
+    results: List[Optional[dict]] = [None] * n_workers
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as executor:
+        future_to_idx = {
+            executor.submit(_train_window_worker_entry, kw): kw["worker_idx"]
+            for kw in worker_kwargs_list
+        }
+        for fut in as_completed(future_to_idx):
+            idx = future_to_idx[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as exc:
+                print(f"[Window {wid}] worker {idx} (seed {seeds[idx]}) "
+                      f"FAILED: {type(exc).__name__}: {exc}")
+                # Surface a stub so downstream aggregation does not break.
+                results[idx] = {
+                    "window_id": wid,
+                    "seed": seeds[idx],
+                    "worker_idx": idx,
+                    **window,
+                    "valid_ic": float("nan"),
+                    "valid_rank_ic": float("nan"),
+                    "test_ic": float("nan"),
+                    "test_rank_ic": float("nan"),
+                    "pool_size": 0,
+                    "pool_path": None,
+                    "best_factor": None,
+                    "best_factor_path": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+
+    return [r for r in results if r is not None]
+
+
+def _summarize_window_best_factors(
+    window: dict,
+    worker_results: List[dict],
+    save_root: str,
+) -> str:
+    """
+    Print and persist the per-window list of best factors (one per parallel
+    pool). Returns the path of the consolidated json file.
+    """
+    wid = window["window_id"]
+    window_dir = os.path.join(save_root, f"window_{wid:03d}")
+    os.makedirs(window_dir, exist_ok=True)
+
+    bests = []
+    for r in worker_results:
+        bests.append({
+            "worker_idx": r.get("worker_idx"),
+            "seed": r.get("seed"),
+            "best": r.get("best_factor"),
+            "valid_ic": r.get("valid_ic"),
+            "test_ic": r.get("test_ic"),
+            "pool_path": r.get("pool_path"),
+            "best_factor_path": r.get("best_factor_path"),
+            "error": r.get("error"),
+        })
+
+    payload = {
+        "window_id": wid,
+        **window,
+        "best_factors": bests,
+    }
+    out_path = os.path.join(window_dir, "all_best_factors.json")
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    # Pretty print the per-window roster.
+    print(f"\n{'='*70}")
+    print(f"[Window {wid}] BEST FACTORS PER PARALLEL POOL")
+    print(f"{'='*70}")
+    header = f"{'worker':>6} {'seed':>5} {'val_IC':>9} {'val_rIC':>9} {'tst_IC':>9} {'tst_rIC':>9}  expr"
+    print(header)
+    print("-" * max(len(header), 70))
+    for entry in bests:
+        bf = entry["best"] or {}
+        if entry.get("error"):
+            print(f"{entry['worker_idx']:>6} {entry['seed']:>5}  <FAILED: {entry['error']}>")
+            continue
+        if not bf:
+            print(f"{entry['worker_idx']:>6} {entry['seed']:>5}  <empty pool>")
+            continue
+        print(
+            f"{entry['worker_idx']:>6} {entry['seed']:>5} "
+            f"{bf.get('valid_ic', float('nan')):>+9.4f} "
+            f"{bf.get('valid_rank_ic', float('nan')):>+9.4f} "
+            f"{bf.get('test_ic', float('nan')):>+9.4f} "
+            f"{bf.get('test_rank_ic', float('nan')):>+9.4f}  "
+            f"{bf.get('expr', '')}"
+        )
+    print(f"Saved: {out_path}")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1318,10 @@ def main(
     valid_restore_cooldown: int = 3,
     # Multi-env parallelism
     n_envs: int = 1,
+    # Per-window parallel pools (each parallel pool = independent RL agent + own seed)
+    n_parallel_pools: int = 2,
+    parallel_seeds: Optional[Union[str, List[int]]] = None,
+    warm_cache_serial: bool = True,
     # Warm-start
     warm_start: bool = True,
     # Stable pool aggregation (step1)
@@ -1063,8 +1386,18 @@ def main(
     :param valid_min_delta: Minimum validation IC improvement to refresh best snapshot
     :param valid_smooth_window: Smoothing window for validation IC
     :param valid_restore_cooldown: Cooldown rollouts after restoration
-    :param n_envs: Number of parallel environments
-    :param warm_start: Carry forward pool across windows
+    :param n_envs: Number of parallel environments inside a single RL worker
+    :param n_parallel_pools: Number of independent RL pools to train concurrently
+        per window (each gets its own seed and writes to ``window_XXX/seed_<S>/``).
+        Default 2. Set to 1 to disable subprocess parallelism.
+    :param parallel_seeds: Optional explicit seed list for the parallel pools.
+        Accepts a JSON list (e.g. ``"[0, 1, 7]"``) or python list. If omitted,
+        defaults to ``[seed, seed+1, ..., seed+n_parallel_pools-1]``.
+    :param warm_cache_serial: When True (default) the parent process touches
+        every window's train/valid/test segment before launching parallel
+        workers, populating the on-disk cache so workers do not race on writes.
+    :param warm_start: Carry forward pool across windows (per-seed chain when
+        n_parallel_pools > 1)
     :param stable_pool_min_occurrence: Min cross-window occurrence for stable factor
     :param stable_pool_min_sign_consistency: Min sign consistency for stable factor
     :param stable_pool_max_factors: Max selected stable factors
@@ -1104,6 +1437,20 @@ def main(
               f"valid {w['valid_start']}~{w['valid_end']} | "
               f"test {w['test_start']}~{w['test_end']}")
 
+    # Resolve per-pool seeds.
+    if parallel_seeds is None:
+        seeds_list: List[int] = [seed + i for i in range(n_parallel_pools)]
+    else:
+        if isinstance(parallel_seeds, str):
+            seeds_list = list(json.loads(parallel_seeds))
+        else:
+            seeds_list = list(parallel_seeds)
+        if len(seeds_list) != n_parallel_pools:
+            raise ValueError(
+                f"parallel_seeds length ({len(seeds_list)}) "
+                f"!= n_parallel_pools ({n_parallel_pools})"
+            )
+
     run_config = {
         "seed": seed, "instruments": instruments, "pool_capacity": pool_capacity,
         "steps_per_window": steps_per_window, "bar_size_sec": bar_size_sec,
@@ -1128,60 +1475,93 @@ def main(
         "stable_pool_min_occurrence": stable_pool_min_occurrence,
         "stable_pool_min_sign_consistency": stable_pool_min_sign_consistency,
         "stable_pool_max_factors": stable_pool_max_factors,
+        "n_parallel_pools": n_parallel_pools,
+        "parallel_seeds": seeds_list,
+        "warm_cache_serial": warm_cache_serial,
         "schedule": schedule,
     }
     with open(os.path.join(save_root, "run_config.json"), "w") as f:
         json.dump(run_config, f, indent=2)
 
-    all_results = []
-    prev_pool_path = None
+    # Kwargs identical for every parallel worker — only seed / worker_idx /
+    # prev_pool_path differ, those are filled in inside ``train_window_parallel``.
+    shared_kwargs = dict(
+        instruments=instruments,
+        features=features,
+        bar_size_sec=bar_size_sec,
+        max_backtrack_bars=max_backtrack_bars,
+        max_future_bars=max_future_bars,
+        pool_capacity=pool_capacity,
+        steps=steps_per_window,
+        data_root=data_root,
+        cache_dir=cache_dir,
+        max_workers=max_workers,
+        device=device,
+        save_root=save_root,
+        ic_mut_threshold=ic_mut_threshold,
+        diversity_bonus=diversity_bonus,
+        single_factor_mode=single_factor_mode,
+        sf_alpha=sf_alpha,
+        sf_beta=sf_beta,
+        sf_tau_ic=sf_tau_ic,
+        sf_tau_r=sf_tau_r,
+        sf_lookback_bars=sf_lookback_bars,
+        sf_turnover_cost=sf_turnover_cost,
+        sf_execution_delay=sf_execution_delay,
+        sf_trivial_penalty=sf_trivial_penalty,
+        llm_warmstart=llm_warmstart,
+        use_llm=use_llm,
+        llm_every_n_steps=llm_every_n_steps,
+        drop_rl_n=drop_rl_n,
+        llm_replace_n=llm_replace_n,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+        gentle_inject=gentle_inject,
+        llm_init_min_pool_size=llm_init_min_pool_size,
+        llm_init_updates=llm_init_updates,
+        llm_forgetful=llm_forgetful,
+        valid_patience=valid_patience,
+        valid_min_delta=valid_min_delta,
+        valid_smooth_window=valid_smooth_window,
+        valid_restore_cooldown=valid_restore_cooldown,
+        n_envs=n_envs,
+    )
+
+    all_results: List[dict] = []                     # flat: one entry per (window, worker)
+    prev_pool_paths: Dict[int, Optional[str]] = {i: None for i in range(n_parallel_pools)}
+    window_summary: List[dict] = []                  # per-window aggregate
 
     for window in schedule:
+        # Pre-warm the on-disk dataset cache in the parent so concurrent
+        # workers do not race on the first write.
+        if warm_cache_serial and n_parallel_pools > 1:
+            try:
+                _warm_data_cache(
+                    window=window,
+                    instruments=instruments,
+                    features=features,
+                    bar_size_sec=bar_size_sec,
+                    max_backtrack_bars=max_backtrack_bars,
+                    max_future_bars=max_future_bars,
+                    data_root=data_root,
+                    cache_dir=cache_dir,
+                    max_workers=max_workers,
+                )
+            except ValueError as e:
+                if "No data in range" in str(e):
+                    print(f"[Tick Rolling] Stop at window {window['window_id']}: {e}")
+                    print("[Tick Rolling] Remaining windows are skipped due to unavailable date range.")
+                    break
+                raise
+
         try:
-            result = train_one_window(
+            worker_results = train_window_parallel(
                 window=window,
-                instruments=instruments,
-                features=features,
-                bar_size_sec=bar_size_sec,
-                max_backtrack_bars=max_backtrack_bars,
-                max_future_bars=max_future_bars,
-                pool_capacity=pool_capacity,
-                steps=steps_per_window,
-                data_root=data_root,
-                cache_dir=cache_dir,
-                max_workers=max_workers,
-                device=device,
-                save_root=save_root,
-                seed=seed,
-                prev_pool_path=prev_pool_path if warm_start else None,
-                ic_mut_threshold=ic_mut_threshold,
-                diversity_bonus=diversity_bonus,
-                single_factor_mode=single_factor_mode,
-                sf_alpha=sf_alpha,
-                sf_beta=sf_beta,
-                sf_tau_ic=sf_tau_ic,
-                sf_tau_r=sf_tau_r,
-                sf_lookback_bars=sf_lookback_bars,
-                sf_turnover_cost=sf_turnover_cost,
-                sf_execution_delay=sf_execution_delay,
-                sf_trivial_penalty=sf_trivial_penalty,
-                llm_warmstart=llm_warmstart,
-                use_llm=use_llm,
-                llm_every_n_steps=llm_every_n_steps,
-                drop_rl_n=drop_rl_n,
-                llm_replace_n=llm_replace_n,
-                llm_base_url=llm_base_url,
-                llm_api_key=llm_api_key,
-                llm_model=llm_model,
-                gentle_inject=gentle_inject,
-                llm_init_min_pool_size=llm_init_min_pool_size,
-                llm_init_updates=llm_init_updates,
-                llm_forgetful=llm_forgetful,
-                valid_patience=valid_patience,
-                valid_min_delta=valid_min_delta,
-                valid_smooth_window=valid_smooth_window,
-                valid_restore_cooldown=valid_restore_cooldown,
-                n_envs=n_envs,
+                seeds=seeds_list,
+                prev_pool_paths=prev_pool_paths if warm_start else {i: None for i in range(n_parallel_pools)},
+                shared_kwargs=shared_kwargs,
+                n_parallel_pools=n_parallel_pools,
             )
         except ValueError as e:
             if "No data in range" in str(e):
@@ -1189,11 +1569,35 @@ def main(
                 print("[Tick Rolling] Remaining windows are skipped due to unavailable date range.")
                 break
             raise
-        all_results.append(result)
-        prev_pool_path = result["pool_path"]
+
+        # Per-window: print + save consolidated best-factor roster.
+        _summarize_window_best_factors(
+            window=window,
+            worker_results=worker_results,
+            save_root=save_root,
+        )
+
+        # Update per-seed warm-start chain only for workers that succeeded.
+        for r in worker_results:
+            wi = r.get("worker_idx")
+            if wi is None:
+                continue
+            new_path = r.get("pool_path")
+            if new_path is not None:
+                prev_pool_paths[wi] = new_path
+
+        all_results.extend(worker_results)
+        window_summary.append({
+            "window_id": window["window_id"],
+            **window,
+            "n_workers": len(worker_results),
+            "best_factors": [r.get("best_factor") for r in worker_results],
+        })
 
         with open(os.path.join(save_root, "rolling_results.json"), "w") as f:
             json.dump(all_results, f, indent=2)
+        with open(os.path.join(save_root, "window_summary.json"), "w") as f:
+            json.dump(window_summary, f, indent=2)
 
     # Stable cross-window factor pool (step1)
     stable_pool = build_stable_pool_from_results(
@@ -1212,23 +1616,46 @@ def main(
         return
 
     # Summary
-    print(f"\n{'='*70}")
+    print(f"\n{'='*82}")
     print("[Tick Rolling] Walk-forward complete:")
-    print(f"{'='*70}")
-    print(f"{'Win':>4} {'Train':>25} {'Test':>25} {'TestIC':>9} {'TestRkIC':>9}")
-    print("-" * 75)
+    print(f"{'='*82}")
+    print(f"{'Win':>4} {'Seed':>5} {'Train':>23} {'Test':>23} {'TestIC':>9} {'TestRkIC':>9}")
+    print("-" * 82)
     for r in all_results:
         print(f"{r['window_id']:>4} "
+              f"{r.get('seed', 0):>5} "
               f"{r['train_start']}~{r['train_end']} "
               f"{r['test_start']}~{r['test_end']} "
               f"{r['test_ic']:>9.4f} {r['test_rank_ic']:>9.4f}")
 
-    avg_ic = np.mean([r["test_ic"] for r in all_results])
-    avg_ric = np.mean([r["test_rank_ic"] for r in all_results])
-    print(f"\nAvg test IC:      {avg_ic:.4f}")
-    print(f"Avg test Rank IC: {avg_ric:.4f}")
-    print(f"Results: {save_root}")
+    valid_test_ic = [r["test_ic"] for r in all_results if not np.isnan(r["test_ic"])]
+    valid_test_ric = [r["test_rank_ic"] for r in all_results if not np.isnan(r["test_rank_ic"])]
+    if valid_test_ic:
+        print(f"\nAvg test IC      ({len(valid_test_ic)} pools): {np.mean(valid_test_ic):.4f}")
+    if valid_test_ric:
+        print(f"Avg test Rank IC ({len(valid_test_ric)} pools): {np.mean(valid_test_ric):.4f}")
+
+    # Per-window best-factor recap
+    print(f"\n{'='*82}")
+    print("[Tick Rolling] BEST FACTOR per window per parallel pool:")
+    print(f"{'='*82}")
+    for ws in window_summary:
+        wid = ws["window_id"]
+        print(f"\nWindow {wid}  test {ws['test_start']}~{ws['test_end']}")
+        for i, bf in enumerate(ws.get("best_factors", [])):
+            if bf is None:
+                print(f"  pool {i}: <empty / failed>")
+            else:
+                print(f"  pool {i} (seed {seeds_list[i]}): "
+                      f"valid_IC={bf.get('valid_ic', float('nan')):+.4f}  "
+                      f"test_IC={bf.get('test_ic', float('nan')):+.4f}  "
+                      f"{bf.get('expr', '')}")
+
+    print(f"\nResults: {save_root}")
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing 'spawn' on platforms where the default
+    # start method differs (and harmless when it doesn't).
+    mp.freeze_support()
     fire.Fire(main)
