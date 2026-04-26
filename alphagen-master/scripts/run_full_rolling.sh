@@ -28,21 +28,47 @@ TEST_MONTHS=2
 STEP_MONTHS=6
 
 # ---- Parse known flags; collect the rest into EXTRA_ARGS ----
+# Handles both "--flag value" and "--flag=value" formats.
+_val() {
+    # Extract value: if $1 contains '=', return the part after it;
+    # otherwise return $2 (next positional) and signal caller to shift twice.
+    if [[ "$1" == *=* ]]; then
+        echo "${1#*=}"
+        return 1   # shift 1
+    else
+        echo "$2"
+        return 0   # shift 2
+    fi
+}
+
 EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --rounds)              ROUNDS="$2"; shift 2 ;;
-        --base_seed)           BASE_SEED="$2"; shift 2 ;;
-        --n_parallel_pools)    N_PARALLEL_POOLS="$2"; shift 2 ;;
-        --steps|--steps_per_window) STEPS_PER_WINDOW="$2"; shift 2 ;;
-        --instruments)         INSTRUMENTS="$2"; shift 2 ;;
-        --data_root)           DATA_ROOT="$2"; shift 2 ;;
-        --global_start)        GLOBAL_START="$2"; shift 2 ;;
-        --global_end)          GLOBAL_END="$2"; shift 2 ;;
-        --train_months)        TRAIN_MONTHS="$2"; shift 2 ;;
-        --valid_months)        VALID_MONTHS="$2"; shift 2 ;;
-        --test_months)         TEST_MONTHS="$2"; shift 2 ;;
-        --step_months)         STEP_MONTHS="$2"; shift 2 ;;
+    key="${1%%=*}"   # flag name without any =value suffix
+    case "$key" in
+        --rounds)
+            ROUNDS="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --base_seed)
+            BASE_SEED="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --n_parallel_pools)
+            N_PARALLEL_POOLS="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --steps|--steps_per_window)
+            STEPS_PER_WINDOW="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --instruments)
+            INSTRUMENTS="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --data_root)
+            DATA_ROOT="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --global_start)
+            GLOBAL_START="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --global_end)
+            GLOBAL_END="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --train_months)
+            TRAIN_MONTHS="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --valid_months)
+            VALID_MONTHS="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --test_months)
+            TEST_MONTHS="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
+        --step_months)
+            STEP_MONTHS="$(_val "$1" "${2:-}")" && shift 2 || shift ;;
         -h|--help)
             sed -n '2,16p' "$0"
             exit 0 ;;
