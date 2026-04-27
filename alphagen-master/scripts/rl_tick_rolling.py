@@ -643,8 +643,10 @@ def train_one_window(
     # Rolling-zscore reward knobs (SingleFactorAlphaPool, per spec)
     sf_alpha: float = 1.0,
     sf_beta: float = 1.0,
+    sf_gamma: float = 1.0,
     sf_tau_ic: float = 0.1,
     sf_tau_r: float = 1e-3,
+    sf_tau_c: float = 1e-4,
     sf_lookback_bars: int = 1200,
     sf_turnover_cost: float = 0.0006,
     sf_execution_delay: int = 1,
@@ -757,8 +759,10 @@ def train_one_window(
                 turnover_cost=sf_turnover_cost,
                 alpha=sf_alpha,
                 beta=sf_beta,
+                gamma=sf_gamma,
                 tau_ic=sf_tau_ic,
                 tau_r=sf_tau_r,
+                tau_c=sf_tau_c,
                 trivial_penalty=sf_trivial_penalty,
             )
         elif single_factor_mode and not HAS_SINGLE_FACTOR_POOL:
@@ -792,8 +796,8 @@ def train_one_window(
         return p
     if single_factor_mode and HAS_SINGLE_FACTOR_POOL:
         print(f"[Window {wid}] Single-factor rolling-zscore reward pool: "
-              f"alpha={sf_alpha}, beta={sf_beta}, "
-              f"tau_ic={sf_tau_ic}, tau_r={sf_tau_r}, "
+              f"alpha={sf_alpha}, beta={sf_beta}, gamma={sf_gamma}, "
+              f"tau_ic={sf_tau_ic}, tau_r={sf_tau_r}, tau_c={sf_tau_c}, "
               f"lookback={sf_lookback_bars}, holding={max_future_bars}, "
               f"delay={sf_execution_delay}, turnover_cost={sf_turnover_cost}, "
               f"ic_mut_threshold={ic_mut_threshold}, "
@@ -1292,8 +1296,10 @@ def main(
     # Rolling-zscore reward knobs (SingleFactorAlphaPool, per spec)
     sf_alpha: float = 1.0,
     sf_beta: float = 1.0,
+    sf_gamma: float = 1.0,
     sf_tau_ic: float = 0.1,
     sf_tau_r: float = 1e-3,
+    sf_tau_c: float = 1e-4,
     sf_lookback_bars: int = 1200,
     sf_turnover_cost: float = 0.0006,
     sf_execution_delay: int = 1,
@@ -1359,12 +1365,15 @@ def main(
     :param single_factor_mode: If True, mine standalone factors ranked by the
         rolling-zscore reward (IC + realized PnL tanh-combined) instead of combo IC.
     :param sf_alpha: Weight on ``tanh(|IC|/tau_ic)`` in the reward sum.
-    :param sf_beta: Weight on ``tanh(r_bar/tau_r)`` in the reward sum.
+    :param sf_beta: Weight on ``tanh(r_bar/tau_r)`` in the reward sum (gross pnl).
+    :param sf_gamma: Weight on ``-tanh(tc/tau_c)`` turnover-cost penalty in the reward sum.
     :param sf_tau_ic: Compression scale for the IC component (tau_ic in the spec).
     :param sf_tau_r: Compression scale for the pnl component (tau_r in the spec).
+    :param sf_tau_c: Compression scale for the turnover-cost penalty (tau_c in the spec).
     :param sf_lookback_bars: Rolling window for z-score normalization (previous bars
         used to compute mu_t / sigma_t). Default 1200 ≈ 1 hour of 3-second bars.
-    :param sf_turnover_cost: Per-bar holding cost lambda in ``r_t = sign(IC)*p_t*ret - lambda*|p_t|``.
+    :param sf_turnover_cost: Per-bar turnover cost rate lambda_c used in
+        ``TC = mean(lambda_c * |p_t - p_{t-1}|)``. r_t itself is gross pnl.
     :param sf_execution_delay: Bars of execution delay between signal observation
         and trade entry. Default 1 means enter at mid[t+1] and exit at mid[t+1+H].
     :param sf_trivial_penalty: If > 0, expressions that are only a single feature combined
@@ -1457,8 +1466,8 @@ def main(
         "use_all_features": use_all_features, "n_features": len(features),
         "max_backtrack_bars": max_backtrack_bars, "max_future_bars": max_future_bars,
         "single_factor_mode": single_factor_mode,
-        "sf_alpha": sf_alpha, "sf_beta": sf_beta,
-        "sf_tau_ic": sf_tau_ic, "sf_tau_r": sf_tau_r,
+        "sf_alpha": sf_alpha, "sf_beta": sf_beta, "sf_gamma": sf_gamma,
+        "sf_tau_ic": sf_tau_ic, "sf_tau_r": sf_tau_r, "sf_tau_c": sf_tau_c,
         "sf_lookback_bars": sf_lookback_bars,
         "sf_turnover_cost": sf_turnover_cost,
         "sf_execution_delay": sf_execution_delay,
@@ -1503,8 +1512,10 @@ def main(
         single_factor_mode=single_factor_mode,
         sf_alpha=sf_alpha,
         sf_beta=sf_beta,
+        sf_gamma=sf_gamma,
         sf_tau_ic=sf_tau_ic,
         sf_tau_r=sf_tau_r,
+        sf_tau_c=sf_tau_c,
         sf_lookback_bars=sf_lookback_bars,
         sf_turnover_cost=sf_turnover_cost,
         sf_execution_delay=sf_execution_delay,

@@ -367,8 +367,10 @@ class SingleFactorAlphaPool(MseAlphaPool):
         turnover_cost: float = 0.0006,
         alpha: float = 1.0,
         beta: float = 1.0,
+        gamma: float = 1.0,
         tau_ic: float = 0.1,
         tau_r: float = 1e-3,
+        tau_c: float = 1e-4,
         trivial_penalty: float = 0.0,
     ):
         super().__init__(capacity, calculator, ic_lower_bound, l1_alpha, device)
@@ -378,8 +380,10 @@ class SingleFactorAlphaPool(MseAlphaPool):
         self.turnover_cost = float(turnover_cost)
         self.alpha = float(alpha)
         self.beta = float(beta)
+        self.gamma = float(gamma)
         self.tau_ic = max(float(tau_ic), 1e-12)
         self.tau_r = max(float(tau_r), 1e-12)
+        self.tau_c = max(float(tau_c), 1e-12)
         self.trivial_penalty = float(trivial_penalty)
         self._ic_mut_threshold = ic_mut_threshold
         # _composite_scores mirrors single_ics but stores the composite score
@@ -389,10 +393,12 @@ class SingleFactorAlphaPool(MseAlphaPool):
         # Per-call reward statistics (in order of insertion)
         self._reward_stats: Dict[str, List[float]] = {
             "abs_ic":    [],   # |IC|
-            "r_bar":     [],   # mean per-bar pnl
-            "comp_ic":   [],   # alpha * tanh(|IC| / tau_ic)
+            "r_bar":     [],   # mean per-bar gross pnl
+            "tc":        [],   # mean per-bar turnover cost lambda_c * |dp|
+            "comp_ic":   [],   # alpha * tanh(|IC|  / tau_ic)
             "comp_r":    [],   # beta  * tanh(r_bar / tau_r)
-            "reward":    [],   # R = comp_ic + comp_r
+            "comp_tc":   [],   # -gamma * tanh(tc   / tau_c)
+            "reward":    [],   # R = comp_ic + comp_r + comp_tc
             "pos_abs_mean": [],
         }
 
@@ -424,11 +430,13 @@ class SingleFactorAlphaPool(MseAlphaPool):
         ic = parts["ic"]
         abs_ic = parts["abs_ic"]
         r_bar = parts["r_bar"]
+        tc = parts.get("tc", 0.0)
         pos_abs = parts.get("pos_abs_mean", 0.0)
 
         comp_ic = self.alpha * math.tanh(abs_ic / self.tau_ic)
         comp_r  = self.beta  * math.tanh(r_bar  / self.tau_r)
-        reward  = comp_ic + comp_r
+        comp_tc = -self.gamma * math.tanh(tc    / self.tau_c)
+        reward  = comp_ic + comp_r + comp_tc
 
         # Direction follows sign(IC)
         direction = 1.0 if ic >= 0 else -1.0
@@ -436,8 +444,10 @@ class SingleFactorAlphaPool(MseAlphaPool):
         stats = self._reward_stats
         stats["abs_ic"].append(float(abs_ic))
         stats["r_bar"].append(float(r_bar))
+        stats["tc"].append(float(tc))
         stats["comp_ic"].append(float(comp_ic))
         stats["comp_r"].append(float(comp_r))
+        stats["comp_tc"].append(float(comp_tc))
         stats["reward"].append(float(reward))
         stats["pos_abs_mean"].append(float(pos_abs))
 
@@ -486,8 +496,10 @@ class SingleFactorAlphaPool(MseAlphaPool):
             "config": {
                 "alpha":            self.alpha,
                 "beta":             self.beta,
+                "gamma":            self.gamma,
                 "tau_ic":           self.tau_ic,
                 "tau_r":            self.tau_r,
+                "tau_c":            self.tau_c,
                 "holding_bars":     self.holding_bars,
                 "execution_delay":  self.execution_delay,
                 "lookback_bars":    self.lookback_bars,
