@@ -158,11 +158,12 @@ class TickCalculator(TensorAlphaCalculator):
             p_t = clip(z_t, -3, 3) / 3
             ret_t = mid[t + delay + H] / mid[t + delay] - 1
             IC = rank-corr(z_t, ret_t)   (over the full training span)
-            r_t = sign(IC) * p_t * ret_t - turnover_cost * |p_t|
+            r_t = sign(IC) * p_t * ret_t              (gross per-bar pnl)
             r_bar = mean(r_t)
+            tc    = mean(turnover_cost * |p_t - p_{t-1}|)   (turnover cost as separate penalty)
 
         Returns:
-            dict with keys {ic, abs_ic, r_bar, n_valid, pos_abs_mean}
+            dict with keys {ic, abs_ic, r_bar, tc, n_valid, pos_abs_mean}
             or None if fewer than 2 valid bars.
         """
         if not self._single_instrument:
@@ -220,14 +221,22 @@ class TickCalculator(TensorAlphaCalculator):
         ic = self._pearson_1d(self._rank_1d(z_v), self._rank_1d(r_v))
         sign_ic = 1.0 if ic >= 0 else -1.0
 
-        # Realized per-bar pnl
-        r_t = sign_ic * p_v * r_v - turnover_cost * p_v.abs()
+        # Gross per-bar pnl (transaction cost moved to separate TC penalty)
+        r_t = sign_ic * p_v * r_v
         r_bar = float(r_t.mean().item())
+
+        # Turnover cost: TC = (1/N) * sum_t lambda_c * |p_t - p_{t-1}|
+        if p_v.shape[0] >= 2:
+            tc = float(turnover_cost * (p_v[1:] - p_v[:-1]).abs().sum().item()
+                       / p_v.shape[0])
+        else:
+            tc = 0.0
 
         return {
             "ic": float(ic),
             "abs_ic": abs(float(ic)),
             "r_bar": r_bar,
+            "tc": tc,
             "n_valid": int(mask.sum().item()),
             "pos_abs_mean": float(p_v.abs().mean().item()),
         }
