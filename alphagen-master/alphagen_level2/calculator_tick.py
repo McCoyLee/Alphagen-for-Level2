@@ -4,7 +4,7 @@ Calculator for tick-level (3s bar) data.
 Drop-in replacement for Level2Calculator, using TickStockData.
 """
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 import torch
 from torch import Tensor
 from alphagen.data.calculator import TensorAlphaCalculator
@@ -20,9 +20,21 @@ class TickCalculator(TensorAlphaCalculator):
     Uses TickStockData instead of Level2StockData.
     """
 
-    def __init__(self, data: TickStockData, target: Optional[Expression] = None):
+    def __init__(
+        self,
+        data: TickStockData,
+        target: Optional[Expression] = None,
+        holding_bars: int = 100,
+        execution_delay: int = 1,
+        lookback_bars: int = 1200,
+    ):
         self.data = data
         self._single_instrument = data.n_stocks == 1
+        # Reward-formula parameters; reused for valid/test IC so the metric
+        # matches the training reward (rolling z-score, delayed forward return).
+        self.holding_bars = int(holding_bars)
+        self.execution_delay = int(execution_delay)
+        self.lookback_bars = int(lookback_bars)
         target_tensor = None
         if target is not None:
             raw_target_tensor = target.evaluate(data)
@@ -143,6 +155,70 @@ class TickCalculator(TensorAlphaCalculator):
         z = torch.where(invalid, torch.full_like(z, float('nan')), z)
         return z
 
+    def _prepare_reward_data(
+        self,
+        expr: Expression,
+        holding_bars: Optional[int] = None,
+        execution_delay: Optional[int] = None,
+        lookback_bars: Optional[int] = None,
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Build the (z_v, p_v, r_v) triplet used by both the reward and the
+        valid/test IC metrics. Falls back to the calculator-level defaults
+        (set in ``__init__``) when the per-call value is omitted.
+
+        Returns ``None`` when there are not enough valid bars.
+        """
+        if not self._single_instrument:
+            return None
+
+        H = self.holding_bars if holding_bars is None else int(holding_bars)
+        D = self.execution_delay if execution_delay is None else int(execution_delay)
+        L = self.lookback_bars if lookback_bars is None else int(lookback_bars)
+
+        data = self.data
+        try:
+            x_raw = expr.evaluate(data)
+        except OutOfDataRangeError:
+            return None
+        x = x_raw.squeeze(-1)  # (T,)
+        T = x.shape[0]
+        if T < L + H + D + 2:
+            return None
+
+        # Rolling z-score and position
+        z = self._rolling_zscore_1d(x, L)
+        p = torch.clamp(z, -3.0, 3.0) / 3.0
+
+        # Forward return via direct raw-mid indexing (avoids mutating the
+        # data-loading buffers). For each usable t, we read mid at
+        # (bt + t + delay) and (bt + t + delay + H).
+        mid_idx = int(TickFeatureType.MID)
+        mid_raw = data.data[:, mid_idx, 0]  # (n_bars_total,)
+        bt = data.max_backtrack_days
+        max_valid = mid_raw.shape[0] - 1
+
+        t_idx = torch.arange(T, device=x.device)
+        enter = bt + t_idx + D
+        exit_ = bt + t_idx + D + H
+
+        valid_idx = (enter >= 0) & (exit_ <= max_valid)
+        enter_s = enter.clamp(0, max_valid)
+        exit_s  = exit_.clamp(0, max_valid)
+        m_enter = mid_raw[enter_s]
+        m_exit  = mid_raw[exit_s]
+
+        ret = torch.where(
+            valid_idx & (m_enter > 0) & ~torch.isnan(m_enter) & ~torch.isnan(m_exit),
+            m_exit / m_enter - 1.0,
+            torch.full_like(m_enter, float('nan')),
+        )
+
+        mask = (~torch.isnan(z)) & (~torch.isnan(ret))
+        if int(mask.sum().item()) < 2:
+            return None
+
+        return z[mask], p[mask], ret[mask]
+
     def calc_single_reward_components(
         self,
         expr: Expression,
@@ -171,51 +247,15 @@ class TickCalculator(TensorAlphaCalculator):
                 "calc_single_reward_components is only implemented for single-instrument data."
             )
 
-        data = self.data
-        try:
-            x_raw = expr.evaluate(data)
-        except OutOfDataRangeError:
-            return None
-        x = x_raw.squeeze(-1)  # (T,)
-        T = x.shape[0]
-        if T < lookback_bars + holding_bars + execution_delay + 2:
-            return None
-
-        # Rolling z-score and position
-        z = self._rolling_zscore_1d(x, lookback_bars)
-        p = torch.clamp(z, -3.0, 3.0) / 3.0
-
-        # Forward return via direct raw-mid indexing (avoids mutating the
-        # data-loading buffers). For each usable t, we read mid at
-        # (bt + t + delay) and (bt + t + delay + H).
-        mid_idx = int(TickFeatureType.MID)
-        mid_raw = data.data[:, mid_idx, 0]  # (n_bars_total,)
-        bt = data.max_backtrack_days
-        max_valid = mid_raw.shape[0] - 1
-
-        t_idx = torch.arange(T, device=x.device)
-        enter = bt + t_idx + execution_delay
-        exit_ = bt + t_idx + execution_delay + holding_bars
-
-        valid_idx = (enter >= 0) & (exit_ <= max_valid)
-        enter_s = enter.clamp(0, max_valid)
-        exit_s  = exit_.clamp(0, max_valid)
-        m_enter = mid_raw[enter_s]
-        m_exit  = mid_raw[exit_s]
-
-        ret = torch.where(
-            valid_idx & (m_enter > 0) & ~torch.isnan(m_enter) & ~torch.isnan(m_exit),
-            m_exit / m_enter - 1.0,
-            torch.full_like(m_enter, float('nan')),
+        prepared = self._prepare_reward_data(
+            expr,
+            holding_bars=holding_bars,
+            execution_delay=execution_delay,
+            lookback_bars=lookback_bars,
         )
-
-        mask = (~torch.isnan(z)) & (~torch.isnan(ret))
-        if int(mask.sum().item()) < 2:
+        if prepared is None:
             return None
-
-        z_v = z[mask]
-        p_v = p[mask]
-        r_v = ret[mask]
+        z_v, p_v, r_v = prepared
 
         # Rank IC of z_t vs forward return (Spearman); sign determines direction
         ic = self._pearson_1d(self._rank_1d(z_v), self._rank_1d(r_v))
@@ -237,6 +277,40 @@ class TickCalculator(TensorAlphaCalculator):
             "abs_ic": abs(float(ic)),
             "r_bar": r_bar,
             "tc": tc,
-            "n_valid": int(mask.sum().item()),
+            "n_valid": int(z_v.numel()),
             "pos_abs_mean": float(p_v.abs().mean().item()),
         }
+
+    # ---- Valid / test IC overrides (single-instrument mode) -------------
+    # Reuse the reward formula's data preparation so valid/test IC reflects
+    # the same setup as training: rolling z-score + delayed forward return.
+    # For multi-instrument data we fall back to the base implementation.
+
+    def calc_single_IC_ret(self, expr: Expression) -> float:
+        if not self._single_instrument:
+            return super().calc_single_IC_ret(expr)
+        prepared = self._prepare_reward_data(expr)
+        if prepared is None:
+            return 0.0
+        z_v, _, r_v = prepared
+        return self._pearson_1d(z_v, r_v)
+
+    def calc_single_rIC_ret(self, expr: Expression) -> float:
+        if not self._single_instrument:
+            return super().calc_single_rIC_ret(expr)
+        prepared = self._prepare_reward_data(expr)
+        if prepared is None:
+            return 0.0
+        z_v, _, r_v = prepared
+        return self._pearson_1d(self._rank_1d(z_v), self._rank_1d(r_v))
+
+    def calc_single_all_ret(self, expr: Expression) -> Tuple[float, float]:
+        if not self._single_instrument:
+            return super().calc_single_all_ret(expr)
+        prepared = self._prepare_reward_data(expr)
+        if prepared is None:
+            return 0.0, 0.0
+        z_v, _, r_v = prepared
+        ic = self._pearson_1d(z_v, r_v)
+        ric = self._pearson_1d(self._rank_1d(z_v), self._rank_1d(r_v))
+        return ic, ric
