@@ -738,7 +738,16 @@ def train_one_window(
         print(f"  {label}: {seg[0]}~{seg[1]}, {ds.n_days} bars, "
               f"{ds.n_stocks} stocks, {ds.n_features} features")
 
-    calculators = [TickCalculator(d, target) for d in datasets]
+    calculators = [
+        TickCalculator(
+            d,
+            target,
+            holding_bars=max_future_bars,
+            execution_delay=sf_execution_delay,
+            lookback_bars=sf_lookback_bars,
+        )
+        for d in datasets
+    ]
 
     # Build pool
     use_diversity = (diversity_bonus > 0 or ic_mut_threshold < 0.99) and not single_factor_mode
@@ -962,6 +971,16 @@ def train_one_window(
         callback=callback,
         tb_log_name=f"window_{wid:03d}_seed{seed:03d}",
     )
+
+    # Restore the best validation-IC snapshot so the persisted final_pool /
+    # downstream metrics reflect the rollback target rather than whatever
+    # state the live pool was left in at the last rollout.
+    if callback._best_valid_snapshot is not None:
+        callback._restore_pool_snapshot()
+        print(f"{tag} Restored best-valid snapshot for final pool "
+              f"(valid IC={callback._best_valid_ic:.4f})")
+    else:
+        print(f"{tag} No valid snapshot recorded; final pool = last live pool")
 
     # Save final pool
     final_pool_path = os.path.join(worker_dir, "final_pool.json")
