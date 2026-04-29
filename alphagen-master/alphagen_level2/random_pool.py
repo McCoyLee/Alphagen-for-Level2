@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Optional, Tuple, List, Dict
 import math
 import torch
+import numpy as np
 
 from alphagen.data.expression import Expression, OutOfDataRangeError
 from alphagen.models.linear_alpha_pool import SingleFactorAlphaPool
@@ -92,6 +93,22 @@ class RandomWindowSingleFactorPool(SingleFactorAlphaPool):
         # Latest reward breakdown (populated by ``_score_expr``); useful for
         # logging in the training loop.
         self.last_reward_info: Dict[str, float] = {}
+        # Diagnostic counters & one-shot warnings.
+        self._n_score_calls = 0
+        self._n_score_no_data = 0
+        self._warned_no_data = False
+        # Sanity-check the lookback geometry once; complain loudly on misuse.
+        if self.lookback_bars + self.holding_bars + self.execution_delay + 4 \
+                > self._sampler.window_bars:
+            print(
+                f"[RandomWindowSingleFactorPool] WARNING: lookback_bars="
+                f"{self.lookback_bars} + holding_bars={self.holding_bars} + "
+                f"execution_delay={self.execution_delay} + 4 exceeds "
+                f"window_bars={self._sampler.window_bars}.  "
+                f"compute_risk_components will always return None — "
+                f"every candidate will be rejected and direction will "
+                f"default to +1.  Reduce lookback_bars (e.g. 200)."
+            )
 
     # ------------------------------------------------------------------
     # Window management
@@ -114,6 +131,28 @@ class RandomWindowSingleFactorPool(SingleFactorAlphaPool):
     def try_new_expr(self, expr: Expression) -> float:
         self.resample_window()
         return super().try_new_expr(expr)
+
+    # ------------------------------------------------------------------
+    # IC filter (override): reject expressions whose forward-return data
+    # cannot be prepared on the current window.  Without this, the parent's
+    # ``calc_single_IC_ret`` returns 0.0 (not NaN) for too-short windows,
+    # the IC filter silently passes, and a degenerate factor with
+    # composite=0 / direction=+1 would be inserted.
+    # ------------------------------------------------------------------
+
+    def _calc_ics(self, expr, ic_mut_threshold=None):
+        try:
+            prepared = self.calculator._prepare_reward_data(
+                expr,
+                holding_bars=self.holding_bars,
+                execution_delay=self.execution_delay,
+                lookback_bars=self.lookback_bars,
+            )
+        except (OutOfDataRangeError, ValueError, RuntimeError):
+            return float("nan"), None
+        if prepared is None:
+            return float("nan"), None
+        return super()._calc_ics(expr, ic_mut_threshold=ic_mut_threshold)
 
     # ------------------------------------------------------------------
     # Reward scoring (override)
@@ -176,9 +215,24 @@ class RandomWindowSingleFactorPool(SingleFactorAlphaPool):
             rbars.append(rc.mean_pnl)
             infos.append(info)
 
+        self._n_score_calls += 1
         if not rewards:
+            self._n_score_no_data += 1
+            if not self._warned_no_data:
+                print(
+                    f"[RandomWindowSingleFactorPool] WARNING: scoring "
+                    f"returned None for the first time (no usable bars in "
+                    f"sampled window).  Check that "
+                    f"lookback_bars + holding_bars + execution_delay + 4 "
+                    f"<= window_bars.  Subsequent failures will be silent."
+                )
+                self._warned_no_data = True
             self.last_reward_info = {"reward": 0.0, "n_windows": 0}
-            return 0.0, 0.0, 0.0, 1.0
+            # Direction = NaN flags this slot for upstream rejection.
+            # The parent ``try_new_expr`` will turn the NaN composite into
+            # a no-op (the ic_ret check we override above already rejects
+            # this path; this is belt-and-braces).
+            return float("nan"), float("nan"), 0.0, float("nan")
 
         reward = sum(rewards) / len(rewards)
         ic = sum(ics) / len(ics)

@@ -12,7 +12,11 @@ Knobs here are the *defaults*; the training script exposes them as flags.
 WINDOW_BARS: int = 1200          # observation/state length (1 hour @ 3s)
 FUTURE_BARS: int = 100           # prediction horizon (~5 min @ 3s)
 EXECUTION_DELAY: int = 1         # bars between signal and entry
-LOOKBACK_BARS: int = 1200        # rolling z-score window for position sizing
+# Rolling z-score lookback for position sizing.  Must satisfy
+#   LOOKBACK_BARS + FUTURE_BARS + EXECUTION_DELAY + 2 <= WINDOW_BARS
+# otherwise every reward call early-exits (no usable bars).  A 200-bar
+# rolling window leaves ~1100 z-score samples per episode.
+LOOKBACK_BARS: int = 200
 EPISODE_HISTORY_BUFFER: int = 1200  # extra bars before the window for warm-up
                                     # (allows DELTA_TIMES up to 1200 inside the
                                     # observation window itself)
