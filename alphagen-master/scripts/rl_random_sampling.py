@@ -57,6 +57,9 @@ from alphagen_level2.gp_evolution import (
     GPGrammar, evolve_pool, expression_size,
 )
 from alphagen_level2.llm_prompts_tick import get_tick_system_prompt
+from alphagen_level2.random_metrics import (
+    RandomSamplingMetricsLogger, plot_random_sampling_curves,
+)
 from alphagen_level2.random_pool import RandomWindowSingleFactorPool
 from alphagen_level2.random_window import RandomWindowSampler
 from alphagen_level2.risk_reward import RewardWeights
@@ -141,6 +144,7 @@ class GPCallback(BaseCallback):
         max_tries: int = 50,
         seed: int = 0,
         enabled: bool = True,
+        metrics_logger: Optional[RandomSamplingMetricsLogger] = None,
         verbose: int = 1,
     ):
         super().__init__(verbose=verbose)
@@ -156,6 +160,7 @@ class GPCallback(BaseCallback):
         self.max_tries = max_tries
         self.rng = random.Random(seed)
         self.enabled = bool(enabled)
+        self.metrics_logger = metrics_logger
         self._epoch = 0
         self._history = []
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
@@ -203,6 +208,8 @@ class GPCallback(BaseCallback):
         self._history.append(record)
         with open(self.log_path, "w") as f:
             json.dump(self._history, f, indent=2)
+        if self.metrics_logger is not None:
+            self.metrics_logger.note_gp_accepted(len(accepted))
         if self.verbose:
             print(f"[GP] epoch={self._epoch} accepted={len(accepted)} "
                   f"pool_size={self.pool.size}")
@@ -213,24 +220,51 @@ class GPCallback(BaseCallback):
 # ---------------------------------------------------------------------------
 
 class PoolSnapshotCallback(BaseCallback):
-    def __init__(self, pool: RandomWindowSingleFactorPool, save_path: str,
-                 every_n_rollouts: int = 5, verbose: int = 0):
+    """Snapshot pool JSON + record per-rollout metrics row.
+
+    Pulls the latest reward seen by the env (from ``pool.last_reward_info``)
+    so the metrics logger can build a recent-reward distribution.  Pool
+    JSON is rewritten every ``every_n_rollouts`` rollouts; metrics are
+    recorded *every* rollout so the convergence plot is dense.
+    """
+
+    def __init__(
+        self,
+        pool: RandomWindowSingleFactorPool,
+        snapshot_path: str,
+        metrics_logger: RandomSamplingMetricsLogger,
+        every_n_rollouts: int = 5,
+        verbose: int = 0,
+    ):
         super().__init__(verbose)
         self.pool = pool
-        self.save_path = save_path
+        self.snapshot_path = snapshot_path
+        self.metrics = metrics_logger
         self.every = max(1, int(every_n_rollouts))
         self._epoch = 0
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(snapshot_path) or ".", exist_ok=True)
 
     def _on_step(self) -> bool:
+        # Capture the latest reward observed by the env so we can build a
+        # rolling reward distribution.  The env appends 0 for non-terminal
+        # steps; we only forward the latest non-zero terminal reward.
+        info = getattr(self.pool, "last_reward_info", None)
+        if info and "reward" in info and info.get("n_windows", 0) > 0:
+            self.metrics.note_recent_reward(float(info["reward"]))
         return True
 
     def _on_rollout_end(self) -> None:
         self._epoch += 1
+        # Always record metrics for a dense plot.
+        try:
+            self.metrics.record(int(self.num_timesteps), self.pool)
+        except Exception as exc:
+            if self.verbose:
+                print(f"[metrics] record failed: {exc}")
         if self._epoch % self.every != 0:
             return
         try:
-            with open(self.save_path, "w") as f:
+            with open(self.snapshot_path, "w") as f:
                 json.dump(self.pool.to_json_dict(), f, indent=2)
         except Exception:
             pass
@@ -247,7 +281,10 @@ def main(
     end_time: str = "2025-12-31",
     bar_size_sec: int = 3,
     use_all_features: bool = True,
-    cache_dir: Optional[str] = None,
+    # ``cache_dir`` mirrors rl_tick_rolling.py — TickStockData pickles its
+    # parsed tensor here so subsequent runs skip HDF5 -> 3s-bar resampling.
+    # Pass ``--cache_dir=None`` to disable.
+    cache_dir: Optional[str] = "./out_random/tick_cache",
     save_root: str = "./out_random",
     seed: int = 0,
     device: str = "cuda:0",
@@ -403,6 +440,10 @@ def main(
         delta_times=DELTA_TIMES,
         max_depth=4,
     )
+    metrics_logger = RandomSamplingMetricsLogger(
+        save_path=os.path.join(save_root, "convergence.csv"),
+        recent_window=256,
+    )
     gp_cb = GPCallback(
         pool=pool, grammar=grammar,
         log_path=os.path.join(save_root, "gp_history.json"),
@@ -415,10 +456,12 @@ def main(
         max_tries=gp_max_tries,
         seed=seed,
         enabled=gp_enabled,
+        metrics_logger=metrics_logger,
     )
     snap_cb = PoolSnapshotCallback(
         pool=pool,
-        save_path=os.path.join(save_root, "pool_latest.json"),
+        snapshot_path=os.path.join(save_root, "pool_latest.json"),
+        metrics_logger=metrics_logger,
         every_n_rollouts=5,
     )
 
@@ -447,6 +490,16 @@ def main(
     with open(os.path.join(save_root, "pool_final.json"), "w") as f:
         json.dump(pool.to_json_dict(), f, indent=2)
     pool.dump_reward_stats(os.path.join(save_root, "reward_stats.json"))
+    # Render the convergence figure (pool_best vs pool_avg curves + GP /
+    # eval / recent-reward panels).
+    try:
+        png_path = plot_random_sampling_curves(
+            csv_path=os.path.join(save_root, "convergence.csv"),
+            output_path=os.path.join(save_root, "convergence.png"),
+        )
+        print(f"[plot] convergence figure -> {png_path}")
+    except Exception as exc:
+        print(f"[plot] failed: {exc}")
     print(f"[done] Pool size={pool.size}, best_obj={pool.best_obj:.4f}")
 
 
